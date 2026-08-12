@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import type { Database } from "../storage.js";
+import { mkdir } from "./mkdir.js";
+import { findPendingWriteBuffer } from "./pendingWriteBuffer.js";
 import { readRangeSync } from "./readFile.js";
 import { resolveInode } from "./resolve.js";
 import { stat } from "./stat.js";
+import { symlink } from "./symlink.js";
 import { withDB } from "./with-db.js";
 import {
   CHUNK_SIZE,
@@ -148,6 +151,20 @@ describe("buffered write lifecycle", () => {
 });
 
 describe("deferred-create lifecycle", () => {
+  it("skips parent resolution when no pending buffers exist", async () => {
+    await withDB((db) => {
+      const originalAll = db.all.bind(db);
+      let queries = 0;
+      db.all = ((query: string, ...bindings: unknown[]) => {
+        queries += 1;
+        return originalAll(query, ...bindings);
+      }) as typeof db.all;
+
+      expect(findPendingWriteBuffer(db, "/missing/file.txt")).toBeUndefined();
+      expect(queries).toBe(0);
+    });
+  });
+
   it("holds the file in memory until release commits one transaction", async () => {
     await withDB(async (db) => {
       openWriteBufferForCreateSync(db, "/pending.txt", { mode: 0o600 }, () => 1000);
@@ -172,6 +189,60 @@ describe("deferred-create lifecycle", () => {
       expect(stat(db, "/pending.txt").size).toBe(5);
       expect(blobCount(db)).toBe(1);
       expect(orphanBlobCount(db)).toBe(0);
+    });
+  });
+
+  it("exposes a symlinked pending create through its real path", async () => {
+    await withDB((db) => {
+      mkdir(db, "/real", {}, () => 1000);
+      symlink(db, "/real", "/linkdir", () => 1000);
+      expect(resolveInode(db, "/real/pending.txt")).toBeNull();
+
+      openWriteBufferForCreateSync(db, "/linkdir/pending.txt", {}, () => 1000);
+      expect(stat(db, "/real/pending.txt").size).toBe(0);
+      writeRangeSync(db, "/real/pending.txt", bytesOf("hello"), 0, {}, () => 1001);
+      expect(stat(db, "/real/pending.txt").size).toBe(5);
+      expect(new TextDecoder().decode(readRangeSync(db, "/real/pending.txt", 0, 5))).toBe("hello");
+      releaseWriteBufferSync(db, "/real/pending.txt", () => 1002);
+
+      expect(resolveInode(db, "/real/pending.txt")?.type).toBe("file");
+    });
+  });
+
+  it("exposes a pending create through every alias of its parent", async () => {
+    await withDB((db) => {
+      mkdir(db, "/real", {}, () => 1000);
+      symlink(db, "/real", "/a", () => 1000);
+      symlink(db, "/real", "/b", () => 1000);
+      openWriteBufferForCreateSync(db, "/a/pending.txt", {}, () => 1000);
+
+      expect(stat(db, "/b/pending.txt").size).toBe(0);
+      writeRangeSync(db, "/b/pending.txt", bytesOf("hello"), 0, {}, () => 1001);
+      expect(new TextDecoder().decode(readRangeSync(db, "/b/pending.txt", 0, 5))).toBe("hello");
+      releaseWriteBufferSync(db, "/b/pending.txt", () => 1002);
+
+      expect(resolveInode(db, "/real/pending.txt")?.type).toBe("file");
+    });
+  });
+
+  it("keeps pending buffer operations free of path lookup queries", async () => {
+    await withDB((db) => {
+      mkdir(db, "/deep/real", { recursive: true }, () => 1000);
+      symlink(db, "/deep/real", "/linkdir", () => 1000);
+      openWriteBufferForCreateSync(db, "/linkdir/pending.txt", {}, () => 1000);
+
+      const originalOne = db.one.bind(db);
+      let lookups = 0;
+      db.one = ((query: string, ...bindings: unknown[]) => {
+        lookups += 1;
+        return originalOne(query, ...bindings);
+      }) as typeof db.one;
+
+      writeRangeSync(db, "/linkdir/pending.txt", bytesOf("hello"), 0, {}, () => 1001);
+      truncateFileSync(db, "/linkdir/pending.txt", 3, () => 1002);
+      openWriteBufferSync(db, "/linkdir/pending.txt");
+
+      expect(lookups).toBe(0);
     });
   });
 

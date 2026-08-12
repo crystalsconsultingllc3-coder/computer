@@ -20,7 +20,7 @@ builds the binary, stages it into `bin/computerd`, and publishes the image
 instead:
 
 ```dockerfile
-FROM ghcr.io/cloudflare/computer-computerd-linux-x64:0.1.0-alpha.1 AS computerd
+FROM ghcr.io/cloudflare/computer-computerd-linux-x64:0.2.0 AS computerd
 FROM debian:stable-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -35,7 +35,10 @@ ENTRYPOINT ["/usr/local/bin/computerd"]
 ```
 
 Pin the image version explicitly. `latest` is fine for experimentation but
-can bite when wire-protocol changes land.
+can bite when wire-protocol changes land. The `Next computerd image` workflow
+publishes `ghcr.io/cloudflare/computer-computerd-linux-x64:next` after
+successful CI on the `release` branch. Use this mutable tag only for tests and
+examples that intentionally track release candidates.
 
 ## Configuration
 

@@ -49,6 +49,11 @@ import { newWebSocketRpcSession, type RpcStub } from "capnweb";
 
 import type { BackendHandle, WorkspaceBackend } from "../../backend.js";
 import { startHeartbeat } from "../../heartbeat.js";
+import {
+  WORKSPACE_EGRESS_TOKEN_HEADER,
+  WORKSPACE_EGRESS_URL_HEADER,
+  type WorkspaceEgressPolicy,
+} from "../../runtime/egress.js";
 import type { IWorkspaceContainerAPI, WorkspaceRef } from "./container-host.js";
 import { probeComputerdHealth } from "./health-probe.js";
 
@@ -82,6 +87,8 @@ export interface CloudflareContainerBackendOptions {
   // Override for tests or to avoid collisions with other backends
   // sharing the same container host.
   egressHost?: string;
+
+  egress?: WorkspaceEgressPolicy;
 
   // TCP port computerd listens on inside the container. Default 8080,
   // matching the Dockerfile shipped with examples/container.
@@ -143,9 +150,14 @@ export class CloudflareContainerBackend implements WorkspaceBackend {
   readonly id: string;
 
   readonly #options: Required<
-    Omit<CloudflareContainerBackendOptions, "container" | "workspace" | "containerEnv" | "id">
+    Omit<
+      CloudflareContainerBackendOptions,
+      "container" | "workspace" | "containerEnv" | "egress" | "id"
+    >
   > &
     Pick<CloudflareContainerBackendOptions, "container" | "workspace" | "containerEnv">;
+  readonly #egress: WorkspaceEgressPolicy;
+  readonly #egressToken: string | undefined;
 
   // State for the in-flight /ws upgrade. handleFetch() resolves
   // #pendingUpgrade; connect() awaits it.
@@ -159,6 +171,8 @@ export class CloudflareContainerBackend implements WorkspaceBackend {
 
   constructor(options: CloudflareContainerBackendOptions) {
     this.id = options.id ?? "container-shell";
+    this.#egress = options.egress ?? { mode: "none" };
+    this.#egressToken = this.#egress.mode === "http-gateway" ? crypto.randomUUID() : undefined;
     this.#options = {
       container: options.container,
       workspace: options.workspace,
@@ -195,8 +209,11 @@ export class CloudflareContainerBackend implements WorkspaceBackend {
       MOUNT_POINT: "/workspace",
       ...this.#options.containerEnv,
     };
-    await host.start(env);
+    await host.start(env, this.#egress.mode === "direct");
     await host.interceptOutboundHttp(this.#options.egressHost, this.#options.workspace);
+    if (this.#egress.mode === "http-gateway" && this.#egressToken !== undefined) {
+      await host.interceptAllOutboundHttp(this.#options.workspace, this.#egressToken);
+    }
 
     // Arm the upgrade promise before posting /connect — computerd
     // dials back as soon as /health on the egress answers, so
@@ -286,6 +303,27 @@ export class CloudflareContainerBackend implements WorkspaceBackend {
   // Returns the 101 response that the WorkspaceProxy fetch handler
   // forwards back to the container.
   async handleFetch(req: Request): Promise<Response> {
+    if (
+      this.#egress.mode === "http-gateway" &&
+      this.#egressToken !== undefined &&
+      req.headers.get(WORKSPACE_EGRESS_TOKEN_HEADER) === this.#egressToken
+    ) {
+      const headers = new Headers(req.headers);
+      const originalUrl = headers.get(WORKSPACE_EGRESS_URL_HEADER);
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(originalUrl ?? "");
+      } catch {
+        return new Response("invalid egress URL", { status: 400 });
+      }
+      if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+        return new Response("invalid egress URL", { status: 400 });
+      }
+      headers.delete(WORKSPACE_EGRESS_TOKEN_HEADER);
+      headers.delete(WORKSPACE_EGRESS_URL_HEADER);
+      const sanitized = new Request(req, { headers });
+      return this.#egress.gateway.fetch(new Request(parsedUrl, sanitized));
+    }
     const url = new URL(req.url);
     if (url.pathname !== "/ws") {
       return new Response("not found", { status: 404 });
@@ -365,7 +403,7 @@ export class CloudflareContainerBackend implements WorkspaceBackend {
 
       if (attempt < maxAttempts) {
         try {
-          await host.restart(env);
+          await host.restart(env, this.#egress.mode === "direct");
           restarts++;
         } catch (error) {
           this.#rejectUpgrade?.(error);

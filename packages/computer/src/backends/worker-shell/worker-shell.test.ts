@@ -19,7 +19,7 @@
 // package's Runner would.
 
 import { SQLiteTestStorage } from "@cloudflare/dofs/testing";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { BackendHandle, WorkspaceBackend } from "../../backend.js";
 import { Workspace } from "../../workspace.js";
@@ -109,6 +109,8 @@ function noopFsBackend(): WorkspaceBackend {
 }
 
 describe("WorkerShellBackend", () => {
+  afterEach(() => vi.restoreAllMocks());
+
   it("returns a BackendHandle with sync: 'none'", async () => {
     const fetcher = fakeFetcher(() => {
       throw new Error("exec not called in this test");
@@ -118,7 +120,9 @@ describe("WorkerShellBackend", () => {
       backends: [noopFsBackend()],
     });
     await ws.ready();
-    const backend = new WorkerShellBackend({ fetcher: () => fetcher });
+    const backend = new WorkerShellBackend({
+      source: { type: "external-runtime", connect: () => fetcher },
+    });
     const handle = await backend.connect();
     expect(handle.sync).toBe("none");
     await handle.close();
@@ -139,7 +143,9 @@ describe("WorkerShellBackend", () => {
       backends: [noopFsBackend()],
     });
     await ws.ready();
-    const backend = new WorkerShellBackend({ fetcher: () => fetcher });
+    const backend = new WorkerShellBackend({
+      source: { type: "external-runtime", connect: () => fetcher },
+    });
     const handle = await backend.connect();
 
     const envelope = await handle.rpc.shell.exec({ source: "echo hello" });
@@ -169,7 +175,9 @@ describe("WorkerShellBackend", () => {
         events: framedStream([{ id: "env", seq: 1, name: "exit", value: 0 }]),
       };
     });
-    const backend = new WorkerShellBackend({ fetcher: () => fetcher });
+    const backend = new WorkerShellBackend({
+      source: { type: "external-runtime", connect: () => fetcher },
+    });
     const handle = await backend.connect();
     const envelope = await handle.rpc.shell.exec({
       source: "printenv TOKEN",
@@ -193,7 +201,9 @@ describe("WorkerShellBackend", () => {
         },
       }),
     }));
-    const handle = await new WorkerShellBackend({ fetcher: () => fetcher }).connect();
+    const handle = await new WorkerShellBackend({
+      source: { type: "external-runtime", connect: () => fetcher },
+    }).connect();
     const envelope = await handle.rpc.shell.exec({ source: "bad" });
     await expect(envelope.events.getReader().read()).rejects.toMatchObject({ code: "EPROTOCOL" });
   });
@@ -212,7 +222,9 @@ describe("WorkerShellBackend", () => {
       backends: [noopFsBackend()],
     });
     await ws.ready();
-    const backend = new WorkerShellBackend({ fetcher: () => fetcher });
+    const backend = new WorkerShellBackend({
+      source: { type: "external-runtime", connect: () => fetcher },
+    });
     const handle = await backend.connect();
     await handle.rpc.shell.exec({ source: "x", cwd: "/workspace/src", id: "fixed" });
     expect(observed?.cwd).toBe("/workspace/src");
@@ -232,7 +244,9 @@ describe("WorkerShellBackend", () => {
     }));
     const ws = new Workspace({
       storage: new SQLiteTestStorage() as never,
-      backends: [new WorkerShellBackend({ fetcher: () => fetcher })],
+      backends: [
+        new WorkerShellBackend({ source: { type: "external-runtime", connect: () => fetcher } }),
+      ],
     });
     await ws.ready();
     const handle = await ws.runtime.exec("echo world", { encoding: "utf8" });
@@ -278,6 +292,170 @@ describe("WorkerShellBackend", () => {
 
     expect(observedDate).toBe("2026-06-17");
     expect(observedFlags).toEqual(["nodejs_compat"]);
+  });
+
+  it("blocks ambient egress by default", async () => {
+    let loaderId: string | undefined;
+    let workerCode: Record<string, unknown> | undefined;
+    const loader = {
+      get(name: string, getCode: () => Record<string, unknown>) {
+        loaderId = name;
+        workerCode = getCode();
+        return {
+          getEntrypoint: () =>
+            fakeFetcher(() => ({
+              id: "x",
+              events: framedStream([{ id: "x", seq: 1, name: "exit", value: 0 }]),
+            })),
+        };
+      },
+    };
+    const backend = new WorkerShellBackend({
+      loader,
+      workspace: { binding: "WorkspaceHost", id: "abc" },
+      ctx: { exports: { WorkspaceServiceProxy: () => ({}) } },
+    });
+
+    await backend.connect();
+
+    expect(loaderId).toBe("workspace-shell:abc:egress-none");
+    expect(workerCode).toMatchObject({ globalOutbound: null });
+  });
+
+  it("omits globalOutbound for direct egress", async () => {
+    let loaderId: string | undefined;
+    let workerCode: Record<string, unknown> | undefined;
+    const loader = {
+      get(name: string, getCode: () => Record<string, unknown>) {
+        loaderId = name;
+        workerCode = getCode();
+        return {
+          getEntrypoint: () =>
+            fakeFetcher(() => ({
+              id: "x",
+              events: framedStream([{ id: "x", seq: 1, name: "exit", value: 0 }]),
+            })),
+        };
+      },
+    };
+    const backend = new WorkerShellBackend({
+      loader,
+      workspace: { binding: "WorkspaceHost", id: "abc" },
+      ctx: { exports: { WorkspaceServiceProxy: () => ({}) } },
+      egress: { mode: "direct" },
+    });
+
+    await backend.connect();
+
+    expect(loaderId).toBe("workspace-shell:abc:egress-direct");
+    expect(workerCode).not.toHaveProperty("globalOutbound");
+  });
+
+  it("routes ambient egress through an HTTP gateway", async () => {
+    let loaderId: string | undefined;
+    let workerCode: Record<string, unknown> | undefined;
+    const gateway = { fetch: async () => new Response() } as Fetcher;
+    const loader = {
+      get(name: string, getCode: () => Record<string, unknown>) {
+        loaderId = name;
+        workerCode = getCode();
+        return {
+          getEntrypoint: () =>
+            fakeFetcher(() => ({
+              id: "x",
+              events: framedStream([{ id: "x", seq: 1, name: "exit", value: 0 }]),
+            })),
+        };
+      },
+    };
+    const backend = new WorkerShellBackend({
+      loader,
+      workspace: { binding: "WorkspaceHost", id: "abc" },
+      ctx: { exports: { WorkspaceServiceProxy: () => ({}) } },
+      egress: { mode: "http-gateway", gateway, revision: "v1" },
+    });
+
+    await backend.connect();
+
+    expect(loaderId).toBe("workspace-shell:abc:egress-http-gateway-v1");
+    expect(workerCode).toMatchObject({ globalOutbound: gateway });
+  });
+
+  it("does not generate a Loader cache key for an external runtime source", async () => {
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue("generated-revision");
+    const runtime = fakeFetcher(() => ({
+      id: "x",
+      events: framedStream([{ id: "x", seq: 1, name: "exit", value: 0 }]),
+    }));
+    const backend = new WorkerShellBackend({
+      source: { type: "external-runtime", connect: () => runtime },
+      egress: {
+        mode: "http-gateway",
+        gateway: { fetch: async () => new Response() } as Fetcher,
+      },
+    });
+
+    const handle = await backend.connect();
+
+    expect(randomUUID).not.toHaveBeenCalled();
+    await handle.close();
+  });
+
+  it("generates one gateway revision when a managed Loader first connects", async () => {
+    const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue("generated-revision");
+    const loaderIds: string[] = [];
+    const runtime = fakeFetcher(() => ({
+      id: "x",
+      events: framedStream([{ id: "x", seq: 1, name: "exit", value: 0 }]),
+    }));
+    const backend = new WorkerShellBackend({
+      loader: {
+        get(name) {
+          loaderIds.push(name);
+          return { getEntrypoint: () => runtime };
+        },
+      },
+      workspace: { binding: "WorkspaceHost", id: "abc" },
+      ctx: { exports: { WorkspaceServiceProxy: () => ({}) } },
+      egress: {
+        mode: "http-gateway",
+        gateway: { fetch: async () => new Response() } as Fetcher,
+      },
+    });
+
+    expect(randomUUID).not.toHaveBeenCalled();
+    const first = await backend.connect();
+    const second = await backend.connect();
+
+    expect(randomUUID).toHaveBeenCalledOnce();
+    expect(loaderIds).toEqual([
+      "workspace-shell:abc:egress-http-gateway-generated-revision",
+      "workspace-shell:abc:egress-http-gateway-generated-revision",
+    ]);
+    await first.close();
+    await second.close();
+  });
+
+  it("passes egress policy to an external runtime source", async () => {
+    const runtime = fakeFetcher(() => ({
+      id: "x",
+      events: framedStream([{ id: "x", seq: 1, name: "exit", value: 0 }]),
+    }));
+    let observed: unknown;
+    const backend = new WorkerShellBackend({
+      source: {
+        type: "external-runtime",
+        async connect(options) {
+          observed = options.egress;
+          return runtime;
+        },
+      },
+      egress: { mode: "direct" },
+    });
+
+    await backend.connect();
+
+    expect(observed).toEqual({ mode: "direct" });
   });
 
   it("disposes Loader entrypoint and worker handles exactly once", async () => {
@@ -336,11 +514,7 @@ describe("WorkerShellBackend", () => {
     expect(workerDisposals).toBe(1);
   });
 
-  it("resolves an async fetcher factory once per connect()", async () => {
-    // A factory that fetches code from KV before minting the
-    // Worker Loader stub will be async. The backend awaits it
-    // exactly once per connect(); subsequent shell.exec calls
-    // reuse the resolved Fetcher.
+  it("resolves an external runtime source once per connect()", async () => {
     const fetcher = fakeFetcher(() => ({
       id: "x",
       events: framedStream([{ id: "x", seq: 1, name: "exit", value: 0 }]),
@@ -352,9 +526,12 @@ describe("WorkerShellBackend", () => {
     });
     await ws.ready();
     const backend = new WorkerShellBackend({
-      fetcher: async () => {
-        factoryCalls += 1;
-        return fetcher;
+      source: {
+        type: "external-runtime",
+        async connect() {
+          factoryCalls += 1;
+          return fetcher;
+        },
       },
     });
     const handle = await backend.connect();

@@ -6,12 +6,12 @@
  * class. This adapter is the bridge from that contract to the public
  * `workspace.fs` surface.
  *
- * Reads go through `fs.readFile(path)` as a `ReadableStream<Uint8Array>`
- * and are stitched together either chunk-by-chunk (`readChunks`) or all
- * at once (`readAll`).
+ * Chunked and ranged reads use one `fs.readFile` stream so remote workspaces
+ * keep one snapshot and one RPC invocation. Edit drains `readAll`; multimodal
+ * reads use a bounded `readChunks` range and capture those bytes once.
  */
 
-import type { FileStat, FileStore } from "./types.js";
+import type { FileStat, MutableFileStore } from "./types.js";
 
 /**
  * Structural subset of `@cloudflare/computer.Workspace` the tools
@@ -26,16 +26,63 @@ export interface WorkspaceLike {
       isFile: boolean;
       isDirectory: boolean;
     }>;
-    readFile(path: string): Promise<ReadableStream<Uint8Array>>;
+    readFile(
+      path: string,
+      options?: { byteOffset?: number; byteLength?: number },
+    ): Promise<ReadableStream<Uint8Array>>;
     writeFile(path: string, content: Uint8Array, options?: { mode?: number }): Promise<void>;
     mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
     rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>;
-    readdir(path: string): Promise<Array<{ name: string; isFile: boolean; isDirectory: boolean }>>;
+    find(
+      directory: string,
+      pattern?: string,
+      options?: { limit?: number; offset?: number },
+    ): Promise<Array<{ path: string; type: "file" | "dir" }>>;
+    grep(
+      pattern: string,
+      path: string,
+      options?: {
+        regex?: boolean;
+        ignoreCase?: boolean;
+        context?: number;
+        limit?: number;
+        offset?: number;
+        include?: string;
+      },
+    ): Promise<
+      Array<{
+        path: string;
+        line: number;
+        text: string;
+        context?: Array<{ line: number; text: string; isMatch: boolean }>;
+      }>
+    >;
+    readdir(
+      path: string,
+      options?: { limit?: number; offset?: number },
+    ): Promise<
+      Array<{
+        name: string;
+        size: number;
+        mtime: number;
+        isFile: boolean;
+        isDirectory: boolean;
+        isSymbolicLink: boolean;
+      }>
+    >;
   };
 }
 
-export class WorkspaceFileStore implements FileStore {
-  constructor(private readonly ws: WorkspaceLike) {}
+type WorkspaceFileStoreLike = {
+  fs: Pick<WorkspaceLike["fs"], "stat" | "readFile" | "writeFile" | "mkdir" | "rm">;
+};
+
+export class WorkspaceFileStore implements MutableFileStore {
+  readonly lockIdentity: object;
+
+  constructor(private readonly ws: WorkspaceFileStoreLike) {
+    this.lockIdentity = ws.fs;
+  }
 
   async stat(path: string): Promise<FileStat | null> {
     try {
@@ -63,56 +110,35 @@ export class WorkspaceFileStore implements FileStore {
     await this.ws.fs.writeFile(path, content, opts);
   }
 
-  async *readChunks(path: string, byteOffset = 0, byteLength?: number): AsyncIterable<Uint8Array> {
-    if (byteOffset < 0) throw new Error("readChunks: byteOffset must be non-negative");
-    if (byteLength !== undefined && byteLength < 0) {
-      throw new Error("readChunks: byteLength must be non-negative");
-    }
-    if (byteLength === 0) return;
+  async remove(path: string, opts?: { recursive?: boolean; force?: boolean }): Promise<void> {
+    await this.ws.fs.rm(path, opts);
+  }
 
-    const stream = await this.ws.fs.readFile(path);
+  async *readChunks(path: string, byteOffset = 0, byteLength?: number): AsyncIterable<Uint8Array> {
+    if (!Number.isSafeInteger(byteOffset) || byteOffset < 0) {
+      throw new Error("readChunks: byteOffset must be a non-negative safe integer");
+    }
+    if (byteLength !== undefined && (!Number.isSafeInteger(byteLength) || byteLength < 0)) {
+      throw new Error("readChunks: byteLength must be a non-negative safe integer");
+    }
+    const stream = await this.ws.fs.readFile(path, { byteOffset, byteLength });
     const reader = stream.getReader();
-    let skipped = 0;
-    let yielded = 0;
     let completed = false;
     try {
       while (true) {
         const { value, done } = await reader.read();
         if (done) {
           completed = true;
-          break;
+          return;
         }
-        if (!value || value.byteLength === 0) continue;
-
-        let start = 0;
-        if (skipped < byteOffset) {
-          const needed = byteOffset - skipped;
-          if (value.byteLength <= needed) {
-            skipped += value.byteLength;
-            continue;
-          }
-          start = needed;
-          skipped = byteOffset;
-        }
-
-        let end = value.byteLength;
-        if (byteLength !== undefined) {
-          const remaining = byteLength - yielded;
-          if (remaining <= 0) break;
-          end = Math.min(end, start + remaining);
-        }
-
-        if (end > start) {
-          const chunk = value.slice(start, end);
-          yielded += chunk.byteLength;
-          yield chunk;
-        }
-
-        if (byteLength !== undefined && yielded >= byteLength) break;
+        if (value !== undefined && value.byteLength > 0) yield value;
       }
     } finally {
-      if (!completed) await reader.cancel();
-      reader.releaseLock();
+      try {
+        if (!completed) await reader.cancel();
+      } finally {
+        reader.releaseLock();
+      }
     }
   }
 }
@@ -143,7 +169,7 @@ async function drain(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   return out;
 }
 
-async function ensureParentDir(ws: WorkspaceLike, path: string): Promise<void> {
+async function ensureParentDir(ws: WorkspaceFileStoreLike, path: string): Promise<void> {
   const i = path.lastIndexOf("/");
   if (i <= 0) return;
   const parent = path.slice(0, i);

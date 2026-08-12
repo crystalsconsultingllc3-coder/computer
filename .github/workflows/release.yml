@@ -1,11 +1,14 @@
 # Changesets-driven release. A green CI run on main either opens/updates the
-# changesets Version Packages PR, or publishes the release after that PR merges.
+# Version Packages PR, or publishes the release after that PR merges.
 #
 # Version PR path:
 #   - contributors commit `.changeset/*.md` files;
-#   - changesets/action runs `.github/changeset-version.mjs`;
-#   - the Version Packages PR commits package versions, changelogs, lockfile
-#     updates, and the Dockerfile/docs pins for the computerd image.
+#   - `.github/changeset-version.mjs` applies the pending versions;
+#   - create-pull-request commits those changes to the `release` branch;
+#   - the Version Packages PR includes package versions, changelogs, lockfile
+#     updates, and the Dockerfile/docs pins for the computerd image;
+#   - this workflow dispatches CI on `release`, which publishes the package
+#     preview and lets the branch image workflow publish `:next`.
 #
 # Publish path:
 #   - no pending changesets remain on main;
@@ -34,6 +37,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
+      # The version path dispatches CI for the release branch.
+      actions: write
       # Trusted publishing on npm requires the OIDC id-token.
       id-token: write
       # changesets/action creates the version PR, release commit, and tags.
@@ -84,6 +89,54 @@ jobs:
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Capture the release plan
+        if: steps.pending-changesets.outputs.present == 'true'
+        run: npx changeset status --output .changeset/release-status.json
+
+      - name: Version packages
+        if: steps.pending-changesets.outputs.present == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node .github/changeset-version.mjs
+
+      - name: Build the Version Packages PR body
+        if: steps.pending-changesets.outputs.present == 'true'
+        run: |
+          trap 'rm -f .changeset/release-status.json' EXIT
+          node .github/changeset-pr-body.mjs \
+            .changeset/release-status.json \
+            "$RUNNER_TEMP/changeset-pr-body.md"
+
+      # changesets/action fixes its branch name to changeset-release/<base>.
+      # Use create-pull-request so the stable Version Packages branch is the
+      # shorter `release` name.
+      - name: Create or update the Version Packages PR
+        id: version-pr
+        if: steps.pending-changesets.outputs.present == 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: release
+          base: main
+          commit-message: Version Packages
+          committer: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          author: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          title: Version Packages
+          body-path: ${{ runner.temp }}/changeset-pr-body.md
+
+      - name: Close the old Version Packages PR
+        if: steps.version-pr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_PR: ${{ steps.version-pr.outputs.pull-request-number }}
+        run: |
+          old_pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+            --base main --head changeset-release/main --json number \
+            --jq '.[0].number // empty')"
+          if [[ -n "$old_pr" ]]; then
+            gh pr close "$old_pr" --repo "$GITHUB_REPOSITORY" --delete-branch \
+              --comment "Superseded by #$VERSION_PR after the release branch was renamed."
+          fi
+
       # The following Docker setup is only needed on the publish path. The
       # Version Packages PR path should not need registry credentials.
       - name: Set up buildx
@@ -110,10 +163,18 @@ jobs:
             -u "$CF_REGISTRY_USERNAME" --password-stdin
 
       - id: changesets
+        if: steps.pending-changesets.outputs.present == 'false'
         uses: changesets/action@v1
         with:
-          version: node .github/changeset-version.mjs
           publish: node .github/changeset-publish.mjs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_CONFIG_PROVENANCE: "true"
+
+      # A branch update made with GITHUB_TOKEN cannot trigger a push workflow.
+      # workflow_dispatch is exempt from that recursion guard.
+      - name: Run CI on the version branch
+        if: steps.pending-changesets.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run ci.yml --ref release

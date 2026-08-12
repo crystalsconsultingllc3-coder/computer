@@ -5,8 +5,12 @@ export {
   WorkspaceFilesystem,
   type WorkspaceFilesystemOptions,
 } from "./fs/filesystem.js";
-export type { WorkspaceFoundEntry } from "./fs/find.js";
-export type { GrepOptions, WorkspaceGrepMatch } from "./fs/grep.js";
+export type { FindOptions, WorkspaceFoundEntry } from "./fs/find.js";
+export type {
+  GrepOptions,
+  WorkspaceGrepContextLine,
+  WorkspaceGrepMatch,
+} from "./fs/grep.js";
 export { link } from "./fs/link.js";
 export type { MkdirOptions } from "./fs/mkdir.js";
 // Read-only mount enforcement. The workspace-side indexer writes

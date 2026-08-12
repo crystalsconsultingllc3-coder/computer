@@ -1,18 +1,34 @@
+import { createHash } from "node:crypto";
+
 import { describe, expect, it } from "vitest";
 
 import type { Database } from "../storage.js";
+import { stageBlob } from "../sync/blobs.js";
+import { link } from "./link.js";
 import { mkdir } from "./mkdir.js";
 import {
   assertNotReadOnly,
   getReadOnlyMountRoots,
   invalidateReadOnlyMountCache,
 } from "./mount-guard.js";
+import { readRangeSync } from "./readFile.js";
 import { rename } from "./rename.js";
 import { resolveInode } from "./resolve.js";
 import { rm } from "./rm.js";
 import { symlink } from "./symlink.js";
 import { withDB } from "./with-db.js";
-import { writeFile, writeFileSync } from "./writeFile.js";
+import {
+  createFileSync,
+  linkStagedChunksSync,
+  openWriteBufferForCreateSync,
+  openWriteBufferSync,
+  releaseWriteBufferSync,
+  truncateFileSync,
+  writeFile,
+  writeFileRangesSync,
+  writeFileSync,
+  writeRangeSync,
+} from "./writeFile.js";
 
 // Stage a read-only mount the way the workspace-side indexer
 // eventually will: a row in `_vfs_mounts` plus an actual subtree
@@ -96,6 +112,16 @@ describe("mount-guard helpers", () => {
     });
   });
 
+  it("treats every path as a descendant of a read-only root mount", async () => {
+    await withDB((db) => {
+      stageMount(db, "/", "read-only");
+
+      expect(() => assertNotReadOnly(db, "/child")).toThrowError(
+        expect.objectContaining({ code: "EROFS" }),
+      );
+    });
+  });
+
   it("read-write mounts do not register as read-only", async () => {
     await withDB(async (db) => {
       stageMount(db, "/workspace/rw", "read-write");
@@ -106,6 +132,21 @@ describe("mount-guard helpers", () => {
 });
 
 describe("writeFile under a read-only mount", () => {
+  it("rejects direct and symlinked writes under a read-only root mount", async () => {
+    await withDB((db) => {
+      mkdir(db, "/actual", {}, () => 0);
+      symlink(db, "/actual", "/link", () => 0);
+      stageMount(db, "/", "read-only");
+
+      expect(() => writeFileSync(db, "/direct.txt", new Uint8Array([1]), {}, () => 0)).toThrowError(
+        expect.objectContaining({ code: "EROFS" }),
+      );
+      expect(() =>
+        writeFileSync(db, "/link/through.txt", new Uint8Array([1]), {}, () => 0),
+      ).toThrowError(expect.objectContaining({ code: "EROFS" }));
+    });
+  });
+
   it("rejects a streaming write under the mount root with EROFS", async () => {
     await withDB(async (db) => {
       // Materialise the directory before flipping the mount to
@@ -138,6 +179,249 @@ describe("writeFile under a read-only mount", () => {
       expect(() =>
         writeFileSync(db, "/workspace/r2/hello.txt", new Uint8Array([1, 2, 3]), {}, () => 0),
       ).toThrow(/EROFS|read-only/);
+    });
+  });
+
+  it("allows opening and releasing a file inside a read-only mount without writing", async () => {
+    await withDB((db) => {
+      mkdir(db, "/mnt", {}, () => 0);
+      writeFileSync(db, "/mnt/file.txt", new Uint8Array([1]), {}, () => 0);
+      stageMount(db, "/mnt", "read-only");
+
+      expect(() => openWriteBufferSync(db, "/mnt/file.txt")).not.toThrow();
+      expect(() => releaseWriteBufferSync(db, "/mnt/file.txt", () => 1)).not.toThrow();
+      expect(resolveInode(db, "/mnt/file.txt")?.type).toBe("file");
+    });
+  });
+
+  it("commits writable hardlink mutations when a read-only alias closes last", async () => {
+    await withDB((db) => {
+      mkdir(db, "/mnt", {}, () => 0);
+      writeFileSync(db, "/outside.txt", new TextEncoder().encode("seed"), {}, () => 0);
+      link(db, "/outside.txt", "/mnt/file.txt");
+      stageMount(db, "/mnt", "read-only");
+
+      openWriteBufferSync(db, "/outside.txt");
+      openWriteBufferSync(db, "/mnt/file.txt");
+      writeRangeSync(db, "/outside.txt", new TextEncoder().encode("done"), 0, {}, () => 1);
+      releaseWriteBufferSync(db, "/outside.txt", () => 2);
+      expect(() => releaseWriteBufferSync(db, "/mnt/file.txt", () => 2)).not.toThrow();
+
+      expect(new TextDecoder().decode(readRangeSync(db, "/outside.txt", 0, 4))).toBe("done");
+      expect(new TextDecoder().decode(readRangeSync(db, "/mnt/file.txt", 0, 4))).toBe("done");
+    });
+  });
+
+  it("evicts rejected dirty bytes before a later read-only open", async () => {
+    await withDB((db) => {
+      mkdir(db, "/mnt", {}, () => 0);
+      writeFileSync(db, "/mnt/file.txt", new TextEncoder().encode("original"), {}, () => 0);
+      openWriteBufferSync(db, "/mnt/file.txt");
+      writeRangeSync(db, "/mnt/file.txt", new TextEncoder().encode("dirty"), 0, {}, () => 1);
+      stageMount(db, "/mnt", "read-only");
+
+      expect(() => releaseWriteBufferSync(db, "/mnt/file.txt", () => 2)).toThrowError(
+        expect.objectContaining({ code: "EROFS" }),
+      );
+      expect(new TextDecoder().decode(readRangeSync(db, "/mnt/file.txt", 0, 8))).toBe("original");
+      expect(() => openWriteBufferSync(db, "/mnt/file.txt")).not.toThrow();
+      expect(() => releaseWriteBufferSync(db, "/mnt/file.txt", () => 3)).not.toThrow();
+    });
+  });
+
+  it("rejects streaming writes through a symlinked parent before staging blobs", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/mnt", {}, () => 0);
+      symlink(db, "/mnt", "/linkdir", () => 0);
+      stageMount(db, "/mnt", "read-only");
+      let pulls = 0;
+      const source = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            pulls += 1;
+            controller.enqueue(new Uint8Array([1]));
+            controller.close();
+          },
+        },
+        { highWaterMark: 0 },
+      );
+
+      await expect(writeFile(db, "/linkdir/new.txt", source, {}, () => 0)).rejects.toMatchObject({
+        code: "EROFS",
+      });
+      expect(pulls).toBe(0);
+      expect(db.scalar<number>("SELECT COUNT(*) FROM vfs_blobs")).toBe(0);
+    });
+  });
+
+  it("rejects writeFileSync through a symlinked parent into a read-only mount", async () => {
+    await withDB((db) => {
+      mkdir(db, "/mnt", {}, () => 0);
+      symlink(db, "/mnt", "/linkdir", () => 0);
+      stageMount(db, "/mnt", "read-only");
+
+      expect(() =>
+        writeFileSync(db, "/linkdir/new.txt", new Uint8Array([1]), {}, () => 0),
+      ).toThrowError(expect.objectContaining({ code: "EROFS" }));
+      expect(resolveInode(db, "/mnt/new.txt")).toBeNull();
+    });
+  });
+
+  it("rejects a final symlink target that escapes a read-only mount", async () => {
+    await withDB((db) => {
+      mkdir(db, "/mnt", {}, () => 0);
+      mkdir(db, "/outside", {}, () => 0);
+      symlink(db, "/outside", "/mnt/escape", () => 0);
+      symlink(db, "/mnt/escape/file.txt", "/entry", () => 0);
+      stageMount(db, "/mnt", "read-only");
+
+      expect(() => writeFileSync(db, "/entry", new Uint8Array([1]), {}, () => 0)).toThrowError(
+        expect.objectContaining({ code: "EROFS" }),
+      );
+      expect(resolveInode(db, "/outside/file.txt")).toBeNull();
+    });
+  });
+
+  it("rejects an intermediate symlink target that escapes a read-only mount", async () => {
+    await withDB((db) => {
+      mkdir(db, "/mnt", {}, () => 0);
+      mkdir(db, "/outside", {}, () => 0);
+      symlink(db, "/outside", "/mnt/escape", () => 0);
+      symlink(db, "/mnt/escape", "/entry", () => 0);
+      stageMount(db, "/mnt", "read-only");
+
+      expect(() =>
+        writeFileSync(db, "/entry/file.txt", new Uint8Array([1]), {}, () => 0),
+      ).toThrowError(expect.objectContaining({ code: "EROFS" }));
+      expect(resolveInode(db, "/outside/file.txt")).toBeNull();
+    });
+  });
+
+  it("rejects file creation through a symlinked parent into a read-only mount", async () => {
+    await withDB((db) => {
+      mkdir(db, "/mnt", {}, () => 0);
+      symlink(db, "/mnt", "/linkdir", () => 0);
+      stageMount(db, "/mnt", "read-only");
+
+      expect(() => createFileSync(db, "/linkdir/new.txt", {}, () => 0)).toThrowError(
+        expect.objectContaining({ code: "EROFS" }),
+      );
+    });
+  });
+
+  it("rejects buffered creation through a symlinked parent into a read-only mount", async () => {
+    await withDB((db) => {
+      mkdir(db, "/mnt", {}, () => 0);
+      symlink(db, "/mnt", "/linkdir", () => 0);
+      stageMount(db, "/mnt", "read-only");
+
+      expect(() => openWriteBufferForCreateSync(db, "/linkdir/new.txt", {}, () => 0)).toThrowError(
+        expect.objectContaining({ code: "EROFS" }),
+      );
+    });
+  });
+
+  it("rechecks the lexical path when a pending create is released", async () => {
+    await withDB((db) => {
+      mkdir(db, "/actual", {}, () => 0);
+      symlink(db, "/actual", "/linkdir", () => 0);
+      openWriteBufferForCreateSync(db, "/linkdir/new.txt", {}, () => 0);
+      stageMount(db, "/linkdir", "read-only");
+
+      expect(() => openWriteBufferSync(db, "/linkdir/new.txt")).not.toThrow();
+      expect(() => releaseWriteBufferSync(db, "/linkdir/new.txt", () => 1)).not.toThrow();
+      expect(() => releaseWriteBufferSync(db, "/linkdir/new.txt", () => 1)).toThrowError(
+        expect.objectContaining({ code: "EROFS" }),
+      );
+      expect(resolveInode(db, "/actual/new.txt")).toBeNull();
+    });
+  });
+
+  it.each([
+    [
+      "whole-file range write",
+      (db: Database) =>
+        writeFileRangesSync(
+          db,
+          "/linkdir/file.txt",
+          new TextEncoder().encode("new"),
+          [{ start: 0, end: 3 }],
+          {},
+          () => 1,
+        ),
+    ],
+    [
+      "positional write",
+      (db: Database) =>
+        writeRangeSync(db, "/linkdir/file.txt", new Uint8Array([1]), 0, {}, () => 1),
+    ],
+    ["truncate", (db: Database) => truncateFileSync(db, "/linkdir/file.txt", 0, () => 1)],
+  ])("rejects %s through a symlinked parent into a read-only mount", async (_name, write) => {
+    await withDB((db) => {
+      mkdir(db, "/mnt", {}, () => 0);
+      writeFileSync(db, "/mnt/file.txt", new TextEncoder().encode("old"), {}, () => 0);
+      symlink(db, "/mnt", "/linkdir", () => 0);
+      stageMount(db, "/mnt", "read-only");
+
+      expect(() => write(db)).toThrowError(expect.objectContaining({ code: "EROFS" }));
+    });
+  });
+
+  it("rejects linkStagedChunksSync under the mount root with EROFS", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/workspace/r2", { recursive: true }, () => 0);
+      stageMount(db, "/workspace/r2", "read-only");
+
+      const bytes = new TextEncoder().encode("blocked");
+      const hash = new Uint8Array(createHash("sha256").update(bytes).digest());
+      stageBlob(db, hash, bytes, 0);
+
+      expect(() =>
+        linkStagedChunksSync(
+          db,
+          "/workspace/r2/hello.txt",
+          ["workspace", "r2", "hello.txt"],
+          [{ hash, size: bytes.byteLength }],
+          {},
+          0,
+        ),
+      ).toThrow(/EROFS|read-only/);
+      expect(resolveInode(db, "/workspace/r2/hello.txt")).toBeNull();
+    });
+  });
+
+  it("rejects staged writes through a symlinked parent into a read-only mount", async () => {
+    await withDB((db) => {
+      mkdir(db, "/mnt", {}, () => 0);
+      symlink(db, "/mnt", "/linkdir", () => 0);
+      stageMount(db, "/mnt", "read-only");
+      const bytes = new TextEncoder().encode("blocked");
+      const hash = new Uint8Array(createHash("sha256").update(bytes).digest());
+      stageBlob(db, hash, bytes, 0);
+
+      expect(() =>
+        linkStagedChunksSync(
+          db,
+          "/linkdir/new.txt",
+          ["linkdir", "new.txt"],
+          [{ hash, size: bytes.byteLength }],
+          {},
+          0,
+        ),
+      ).toThrowError(expect.objectContaining({ code: "EROFS" }));
+      expect(resolveInode(db, "/mnt/new.txt")).toBeNull();
+    });
+  });
+
+  it("allows writes through a symlink to a directory that contains a read-only mount", async () => {
+    await withDB((db) => {
+      mkdir(db, "/workspace/scratch", { recursive: true }, () => 0);
+      symlink(db, "/workspace", "/link", () => 0);
+      stageMount(db, "/workspace/r2", "read-only");
+
+      writeFileSync(db, "/link/scratch/file.txt", new Uint8Array([1]), {}, () => 0);
+
+      expect(resolveInode(db, "/workspace/scratch/file.txt")?.type).toBe("file");
     });
   });
 

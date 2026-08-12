@@ -29,6 +29,11 @@ export interface WriteBufferEntry {
   // Mode the caller wants persisted on release. Defaults to the
   // inode's existing mode at open time when the caller has none.
   mode: number;
+  // Lexical and effective paths used by the most recent successful
+  // mutation. Dirty release validates these paths rather than whichever
+  // hardlink alias happens to close last.
+  dirtyPath?: string;
+  dirtyTargetPath?: string;
   // Pending-create state. When set, no inode row exists yet; release
   // will INSERT the node + dirent + chunks in one transaction. The
   // synthetic inode id used to key this entry in the cache is stored
@@ -38,6 +43,8 @@ export interface WriteBufferEntry {
     parentInode: number;
     leafName: string;
     canonicalPath: string;
+    resolvedPath: string;
+    ancestorInodes: number[];
     pendingInode: number;
     mtime: number;
   };
@@ -46,6 +53,7 @@ export interface WriteBufferEntry {
 interface DatabaseCache {
   byInode: Map<number, WriteBufferEntry>;
   byPendingPath: Map<string, WriteBufferEntry>;
+  byPendingParent: Map<string, WriteBufferEntry>;
   nextPendingInode: number;
 }
 
@@ -54,7 +62,12 @@ const caches = new WeakMap<Database, DatabaseCache>();
 function cacheFor(db: Database): DatabaseCache {
   let cache = caches.get(db);
   if (cache === undefined) {
-    cache = { byInode: new Map(), byPendingPath: new Map(), nextPendingInode: -1 };
+    cache = {
+      byInode: new Map(),
+      byPendingPath: new Map(),
+      byPendingParent: new Map(),
+      nextPendingInode: -1,
+    };
     caches.set(db, cache);
   }
   return cache;
@@ -71,17 +84,33 @@ export function getPendingWriteBufferByPath(
   return caches.get(db)?.byPendingPath.get(canonicalPath);
 }
 
+function pendingParentKey(parentInode: number, leafName: string): string {
+  return `${parentInode}:${leafName}`;
+}
+
+export function getPendingWriteBufferByParent(
+  db: Database,
+  parentInode: number,
+  leafName: string,
+): WriteBufferEntry | undefined {
+  return caches.get(db)?.byPendingParent.get(pendingParentKey(parentInode, leafName));
+}
+
+export function hasPendingWriteBuffers(db: Database): boolean {
+  return (caches.get(db)?.byPendingParent.size ?? 0) > 0;
+}
+
 // List pending-create buffers whose parent dirent matches `parentInode`.
 // Used by readdir so freshly-created-but-not-yet-released files show
 // up in directory listings between open and release.
 export function listPendingByParent(db: Database, parentInode: number): WriteBufferEntry[] {
+  return listPendingWriteBuffers(db).filter((entry) => entry.pending?.parentInode === parentInode);
+}
+
+export function listPendingWriteBuffers(db: Database): WriteBufferEntry[] {
   const cache = caches.get(db);
   if (cache === undefined) return [];
-  const out: WriteBufferEntry[] = [];
-  for (const entry of cache.byPendingPath.values()) {
-    if (entry.pending?.parentInode === parentInode) out.push(entry);
-  }
-  return out;
+  return [...cache.byInode.values()].filter((entry) => entry.pending !== undefined);
 }
 
 export function setWriteBuffer(db: Database, inode: number, entry: WriteBufferEntry): void {
@@ -89,6 +118,11 @@ export function setWriteBuffer(db: Database, inode: number, entry: WriteBufferEn
   cache.byInode.set(inode, entry);
   if (entry.pending !== undefined) {
     cache.byPendingPath.set(entry.pending.canonicalPath, entry);
+    cache.byPendingPath.set(entry.pending.resolvedPath, entry);
+    cache.byPendingParent.set(
+      pendingParentKey(entry.pending.parentInode, entry.pending.leafName),
+      entry,
+    );
   }
 }
 
@@ -98,6 +132,10 @@ export function deleteWriteBuffer(db: Database, inode: number): void {
   const entry = cache.byInode.get(inode);
   if (entry?.pending !== undefined) {
     cache.byPendingPath.delete(entry.pending.canonicalPath);
+    cache.byPendingPath.delete(entry.pending.resolvedPath);
+    cache.byPendingParent.delete(
+      pendingParentKey(entry.pending.parentInode, entry.pending.leafName),
+    );
   }
   cache.byInode.delete(inode);
 }
@@ -122,6 +160,10 @@ export function promotePendingToInode(db: Database, pendingInode: number, realIn
   if (entry === undefined) return;
   if (entry.pending !== undefined) {
     cache.byPendingPath.delete(entry.pending.canonicalPath);
+    cache.byPendingPath.delete(entry.pending.resolvedPath);
+    cache.byPendingParent.delete(
+      pendingParentKey(entry.pending.parentInode, entry.pending.leafName),
+    );
     entry.pending = undefined;
   }
   cache.byInode.delete(pendingInode);

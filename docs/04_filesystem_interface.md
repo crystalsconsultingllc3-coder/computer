@@ -37,18 +37,39 @@ method-by-method mapping against `node:fs/promises`.
 ### `readFile`
 
 ```ts
+type ReadFileRange = {
+  byteOffset?: number; // default 0
+  byteLength?: number; // default: remainder of the file
+};
+
 readFile(path: string): Promise<ReadableStream<Uint8Array>>
 readFile(path: string, encoding: "utf8"): Promise<string>
-readFile(path: string, options: { encoding?: "utf8" }): Promise<string>
+readFile(path: string, options: ReadFileRange): Promise<ReadableStream<Uint8Array>>
+readFile(
+  path: string,
+  options: ReadFileRange & { encoding: "utf8" },
+): Promise<string>
 ```
 
 Defaulting to a stream is deliberate — most reads in an agent context
-are "send this file somewhere" and never need to be in memory.
+are "send this file somewhere" and never need to be in memory. A ranged
+stream resolves the file and captures its overlapping chunk rows once,
+then lazily sends those content-addressed blobs. This preserves the existing
+whole-file stream behavior across ordinary concurrent writes while avoiding
+reads before `byteOffset`. The same single stream
+crosses the Workers RPC boundary; callers do not issue one RPC invocation
+per storage chunk.
 
 ```ts
 // Stream a large file straight to the client.
 const stream = await fs.readFile("/workspace/build/out.wasm");
 return new Response(stream, { headers: { "content-type": "application/wasm" } });
+
+// Resume a stream at a byte continuation and cap the transfer.
+const continuation = await fs.readFile("/workspace/build/out.wasm", {
+  byteOffset: 1_048_576,
+  byteLength: 262_144,
+});
 
 // Read a small text file into a string.
 const todo = await fs.readFile("/workspace/notes/todo.md", "utf8");
@@ -187,7 +208,11 @@ console.log(`${s.size} bytes, modified ${new Date(s.mtime).toISOString()}`);
 ```ts
 find(
   directory: string,
-  pattern?:  string,           // simple glob (`*.ts`, `**/*.md`)
+  pattern?: string,            // simple glob (`*.ts`, `**/*.md`)
+  options?: {
+    limit?: number;
+    offset?: number;
+  },
 ): Promise<Array<{ path; type: "file" | "dir" }>>
 ```
 
@@ -197,7 +222,7 @@ matched against each candidate's path **relative to `directory`**, not
 its absolute path — so `**/*.ts` under `/workspace/src` matches
 `a/b.ts`, not `/workspace/src/a/b.ts`.
 
-Only `*`, `**`, and `**/` are honored; `?`, character classes, and
+The glob supports `*`, `**`, `**/`, and `?`. Character classes and
 brace expansions are matched literally.
 
 ```ts
@@ -231,38 +256,61 @@ const paths = await fs.ls("/workspace/.agents/skills");
 
 ### `grep`
 
-Available on `Workspace.fs` for parity with the agent tools, and on
-`Workspace.runtime` when you want it to run inside the container (faster
-for large trees because it uses ripgrep).
+`Workspace.fs.grep` accepts this interface:
 
 ```ts
+interface GrepOptions {
+  regex?: boolean;
+  ignoreCase?: boolean;
+  context?: number;
+  limit?: number;
+  offset?: number;
+  include?: string;
+}
+
+interface WorkspaceGrepContextLine {
+  line: number;
+  text: string;
+  isMatch: boolean;
+}
+
+interface WorkspaceGrepMatch {
+  path: string;
+  line: number;
+  text: string;
+  context?: WorkspaceGrepContextLine[];
+}
+
 grep(
   pattern: string,
-  path:    string,
-  options?: { ignoreCase?: boolean }
-): Promise<{ path: string; line: number; text: string }[]>
+  path: string,
+  options?: GrepOptions,
+): Promise<WorkspaceGrepMatch[]>
 ```
 
-`pattern` is a **literal substring** — not a regex, not a glob.
-`ignoreCase` lowercases both sides before comparing.
+Matching is literal and case-sensitive by default. Set `regex: true` to
+interpret `pattern` as a regular expression and `ignoreCase: true` to ignore
+letter case. `context` adds that many lines before and after each match.
+`include` is a glob relative to a searched directory. `limit` and `offset`
+paginate matching lines.
 
-`path` may be a directory **or a single file**. Directory walks return
-matches in walk order. Each result row carries:
-
-- `path` — absolute path of the matching file.
-- `line` — 1-indexed line number within that file.
-- `text` — the entire matching line (without the trailing newline), not
-  just the matched substring.
+`path` may be a directory or a single file. Directory searches return matches
+in deterministic depth-first discovery order, then line order within each
+file. Results are not globally sorted by full path.
 
 ```ts
-const hits = await fs.grep("TODO", "/workspace/src", { ignoreCase: true });
+const hits = await fs.grep("TODO", "/workspace/src", {
+  ignoreCase: true,
+  include: "**/*.ts",
+});
 for (const hit of hits) {
   console.log(`${hit.path}:${hit.line}: ${hit.text}`);
 }
 ```
 
-See [05. Shell Interface](./05_runtime_interface.md) for the container-side
-variant.
+`Workspace.runtime` exposes a narrower container-side variant that accepts only
+`ignoreCase` and treats its pattern as a literal string. See
+[05. Shell Interface](./05_runtime_interface.md) for that variant.
 
 ## Error handling
 
@@ -342,8 +390,8 @@ maps to `Workspace.fs`:
 | `symlink` / `readlink` | — | Not on the public surface; see note below. |
 | `watch` | — | Low-level primitive in `fs/watch.ts` (`createWatcher`, `createWatchAsyncIterable`, `WatchHandle`, `WatchOptions`); not exposed on the `WorkspaceFilesystem` class. |
 | `open` / `FileHandle` | — | Use streams instead. |
-| `glob` | `find` | Limited glob support (`*`, `**`, `**/` only). |
-| — | `grep` | Not in `node:fs`; included here for agents. Substring match. |
+| `glob` | `find` | Limited glob support (`*`, `**`, `**/`, and `?`). |
+| — | `grep` | Not in `node:fs`; literal by default, with optional regular expressions. |
 | — | `find` | Recursive directory walk with an optional glob, relative-rooted. |
 | — | `ls` | Flat list of file paths under a directory (segment-aware). |
 

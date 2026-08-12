@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+
+import { describe, expect, it, vi } from "vitest";
 
 import { link } from "../fs/link.js";
 import { mkdir } from "../fs/mkdir.js";
@@ -10,8 +12,9 @@ import { resolveInode } from "../fs/resolve.js";
 import { rm } from "../fs/rm.js";
 import { symlink } from "../fs/symlink.js";
 import { withDB, withTwoDBs } from "../fs/with-db.js";
-import { writeFile, writeFileSync } from "../fs/writeFile.js";
+import { CHUNK_SIZE, writeFile, writeFileSync } from "../fs/writeFile.js";
 import { applyChanges, applyChangesSync } from "./apply.js";
+import { stageBlob } from "./blobs.js";
 import type { ChangeEntry } from "./changes.js";
 import { coalesceChanges } from "./coalesce.js";
 import { fetchObjects } from "./fetch.js";
@@ -71,6 +74,171 @@ describe("applyChanges", () => {
         expect(await readFile(b, "/b.txt", "utf8")).toBe("beta");
       },
     );
+  });
+
+  it("links staged chunks without reading payload bytes", async () => {
+    const content = `${"a".repeat(CHUNK_SIZE)}b`;
+    await withTwoDBs(
+      async (a) => {
+        await writeFile(a, "/large.txt", content, {}, () => 1);
+        const entries = await drain(coalesceChanges(a, 0));
+        const entry = entries.find((candidate) => candidate.path === "/large.txt");
+        if (entry?.kind !== "file") throw new Error("missing file entry");
+        expect(entry.chunks).toHaveLength(2);
+        return { entry, objects: await collectObjects(a, [entry]) };
+      },
+      async (b, { entry, objects }) => {
+        for (const chunk of entry.chunks) {
+          const bytes = objects.get(hex(chunk.hash));
+          if (bytes === undefined) throw new Error("missing chunk bytes");
+          stageBlob(b, chunk.hash, bytes, 2);
+        }
+
+        const all = vi.spyOn(b, "all");
+        try {
+          await applyChanges(b, [entry], new Map(), { source: "upstream" });
+          const payloadReads = all.mock.calls.filter(([query]) =>
+            query.includes("SELECT bytes FROM vfs_blob_bytes"),
+          );
+          expect(all.mock.calls.length).toBeGreaterThan(0);
+          expect(payloadReads).toHaveLength(0);
+        } finally {
+          all.mockRestore();
+        }
+        expect(await readFile(b, "/large.txt", "utf8")).toBe(content);
+      },
+    );
+  });
+
+  it("links staged chunks synchronously without reading payload bytes", async () => {
+    const content = `${"a".repeat(CHUNK_SIZE)}b`;
+    await withTwoDBs(
+      async (a) => {
+        await writeFile(a, "/large.txt", content, {}, () => 1);
+        const entries = await drain(coalesceChanges(a, 0));
+        const entry = entries.find((candidate) => candidate.path === "/large.txt");
+        if (entry?.kind !== "file") throw new Error("missing file entry");
+        expect(entry.chunks).toHaveLength(2);
+        return { entry, objects: await collectObjects(a, [entry]) };
+      },
+      async (b, { entry, objects }) => {
+        for (const chunk of entry.chunks) {
+          const bytes = objects.get(hex(chunk.hash));
+          if (bytes === undefined) throw new Error("missing chunk bytes");
+          stageBlob(b, chunk.hash, bytes, 2);
+        }
+
+        const all = vi.spyOn(b, "all");
+        try {
+          applyChangesSync(b, [entry], new Map(), { source: "upstream" });
+          const payloadReads = all.mock.calls.filter(([query]) =>
+            query.includes("SELECT bytes FROM vfs_blob_bytes"),
+          );
+          expect(all.mock.calls.length).toBeGreaterThan(0);
+          expect(payloadReads).toHaveLength(0);
+        } finally {
+          all.mockRestore();
+        }
+        expect(await readFile(b, "/large.txt", "utf8")).toBe(content);
+      },
+    );
+  });
+
+  it("rejects a file entry whose interior chunks are not chunk-aligned", async () => {
+    // Positional reads locate a chunk by dividing the offset by
+    // CHUNK_SIZE, so only the final chunk may be short. Linking a
+    // sender's chunk list verbatim has to enforce that.
+    await withDB(async (db) => {
+      const first = new TextEncoder().encode("first");
+      const second = new TextEncoder().encode("second");
+      const chunks = [first, second].map((bytes) => {
+        const hash = new Uint8Array(createHash("sha256").update(bytes).digest());
+        stageBlob(db, hash, bytes, 1000);
+        return { hash, size: bytes.byteLength };
+      });
+
+      await expect(
+        applyChanges(
+          db,
+          [
+            {
+              kind: "file",
+              rev: 1,
+              path: "/ragged.txt",
+              mode: 0o644,
+              mtime: 1000,
+              size: first.byteLength + second.byteLength,
+              chunks,
+            },
+          ],
+          new Map(),
+          { source: "upstream" },
+        ),
+      ).rejects.toThrow(/chunk/);
+      expect(resolveInode(db, "/ragged.txt")).toBeNull();
+    });
+  });
+
+  it("leaves the existing file in place when it rejects a ragged entry", async () => {
+    await withDB(async (db) => {
+      await writeFile(db, "/keep.txt", "original", {}, () => 1000);
+
+      const first = new TextEncoder().encode("first");
+      const second = new TextEncoder().encode("second");
+      const chunks = [first, second].map((bytes) => {
+        const hash = new Uint8Array(createHash("sha256").update(bytes).digest());
+        stageBlob(db, hash, bytes, 1000);
+        return { hash, size: bytes.byteLength };
+      });
+
+      await expect(
+        applyChanges(
+          db,
+          [
+            {
+              kind: "file",
+              rev: 2,
+              path: "/keep.txt",
+              mode: 0o644,
+              mtime: 2000,
+              size: first.byteLength + second.byteLength,
+              chunks,
+            },
+          ],
+          new Map(),
+          { source: "upstream" },
+        ),
+      ).rejects.toThrow(/chunk/);
+      expect(await readFile(db, "/keep.txt", "utf8")).toBe("original");
+    });
+  });
+
+  it("rejects a file entry with a chunk larger than the chunk size", async () => {
+    await withDB(async (db) => {
+      const bytes = new Uint8Array(CHUNK_SIZE + 1);
+      const hash = new Uint8Array(createHash("sha256").update(bytes).digest());
+      stageBlob(db, hash, bytes, 1000);
+
+      await expect(
+        applyChanges(
+          db,
+          [
+            {
+              kind: "file",
+              rev: 1,
+              path: "/oversized.bin",
+              mode: 0o644,
+              mtime: 1000,
+              size: bytes.byteLength,
+              chunks: [{ hash, size: bytes.byteLength }],
+            },
+          ],
+          new Map(),
+          { source: "upstream" },
+        ),
+      ).rejects.toThrow(/chunk/);
+      expect(resolveInode(db, "/oversized.bin")).toBeNull();
+    });
   });
 
   it("commits in batches capped by byte budget", async () => {

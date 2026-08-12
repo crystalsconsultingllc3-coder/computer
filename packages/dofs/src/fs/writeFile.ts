@@ -6,8 +6,11 @@ import { ROOT_INODE } from "../schema/index.js";
 import type { Database } from "../storage.js";
 import { stageBlob } from "../sync/blobs.js";
 import { buildManifest } from "../sync/manifests.js";
+import { pathOf } from "../sync/paths.js";
 import { getBlobBytes } from "./blobCache.js";
-import { assertNotReadOnly } from "./mount-guard.js";
+import { assertNotInReadOnlyMount, assertNotReadOnly } from "./mount-guard.js";
+import { findPendingWriteBuffer } from "./pendingWriteBuffer.js";
+import { resolveInode } from "./resolve.js";
 import { invalidateResolveExact } from "./resolveCache.js";
 import {
   allocatePendingInode,
@@ -15,6 +18,7 @@ import {
   ensureCapacity as ensureBufferCapacity,
   getPendingWriteBufferByPath,
   getWriteBuffer,
+  listPendingWriteBuffers,
   promotePendingToInode,
   setWriteBuffer,
   type WriteBufferEntry,
@@ -37,13 +41,42 @@ export interface WriteFileRange {
   end: number;
 }
 
-// Resolve directory-only paths (the parent of the target file). The
-// final segment is handled by the caller. Returns the parent inode or
-// throws ENOENT/ENOTDIR.
-function resolveParent(db: Database, parts: string[], canonical: string): number {
-  let parentInode = ROOT_INODE;
-  for (let i = 0; i < parts.length - 1; i++) {
-    const name = parts[i];
+interface SymlinkFollowState {
+  count: number;
+}
+
+interface ResolvedParent {
+  inode: number;
+  canonicalPath: string;
+  ancestorInodes: number[];
+}
+
+// Resolve the target's parent one component at a time. Expanding links
+// here preserves ENOTDIR errors and lets final and intermediate links
+// share one follow limit.
+function resolveParent(
+  db: Database,
+  parts: string[],
+  canonical: string,
+  follows: SymlinkFollowState,
+): ResolvedParent {
+  const pendingParts = parts.slice(0, -1);
+  const inodeStack = [ROOT_INODE];
+  const realParts: string[] = [];
+  const ancestorInodes = new Set([ROOT_INODE]);
+
+  while (pendingParts.length > 0) {
+    const name = pendingParts.shift();
+    if (name === undefined || name === "" || name === ".") continue;
+    if (name === "..") {
+      if (inodeStack.length > 1) {
+        inodeStack.pop();
+        realParts.pop();
+      }
+      continue;
+    }
+
+    const parentInode = inodeStack[inodeStack.length - 1];
     const child = db.one<{ child_inode: number }>(
       "SELECT child_inode FROM vfs_dirents WHERE parent_inode = ? AND name = ?",
       parentInode,
@@ -52,23 +85,44 @@ function resolveParent(db: Database, parts: string[], canonical: string): number
     if (child === undefined) {
       throw createWorkspaceError("ENOENT", `parent directory missing: ${canonical}`, canonical);
     }
-    const next = db.one<{ inode: number; type: "file" | "dir" }>(
-      "SELECT inode, type FROM vfs_nodes WHERE inode = ?",
-      child.child_inode,
-    );
-    if (next === undefined) {
+    const node = db.one<{
+      inode: number;
+      type: "file" | "dir" | "symlink";
+      link_target: string | null;
+    }>("SELECT inode, type, link_target FROM vfs_nodes WHERE inode = ?", child.child_inode);
+    if (node === undefined) {
       throw createWorkspaceError("ENOENT", `dangling dirent: ${canonical}`, canonical);
     }
-    if (next.type !== "dir") {
+    if (node.type === "symlink") {
+      ancestorInodes.add(node.inode);
+      countSymlinkFollow(follows, canonical);
+      const target = node.link_target ?? "";
+      const targetParts = symlinkTargetParts(target, realParts);
+      assertNotInReadOnlyMount(db, clampedPathFromParts(targetParts));
+      if (target.startsWith("/")) {
+        inodeStack.splice(1);
+        realParts.splice(0);
+      }
+      pendingParts.unshift(...target.split("/"));
+      continue;
+    }
+    if (node.type !== "dir") {
       throw createWorkspaceError(
         "ENOTDIR",
         `parent path segment is not a directory: ${canonical}`,
         canonical,
       );
     }
-    parentInode = next.inode;
+    inodeStack.push(node.inode);
+    realParts.push(name);
+    ancestorInodes.add(node.inode);
   }
-  return parentInode;
+
+  return {
+    inode: inodeStack[inodeStack.length - 1],
+    canonicalPath: pathFromParts(realParts),
+    ancestorInodes: [...ancestorInodes],
+  };
 }
 
 async function materialize(content: string | Uint8Array): Promise<Uint8Array> {
@@ -97,6 +151,148 @@ interface PreparedChunk {
 interface ChunkRef {
   hash: Uint8Array;
   size: number;
+}
+
+type WriteTarget =
+  | { kind: "existing"; inode: number; canonicalPath: string }
+  | { kind: "create"; parentInode: number; leafName: string; canonicalPath: string };
+
+interface DirectWriteTarget {
+  parentInode: number;
+  leafName: string;
+  canonicalPath: string;
+  ancestorInodes: number[];
+  existingInode?: number;
+}
+
+// Match resolveInode's Linux-compatible cap. Final symlinks are
+// unwound here because a dangling chain must create its last target.
+const MAX_SYMLINK_FOLLOWS = 40;
+
+function countSymlinkFollow(follows: SymlinkFollowState, path: string): void {
+  follows.count += 1;
+  if (follows.count > MAX_SYMLINK_FOLLOWS) {
+    throw createWorkspaceError("ELOOP", "too many symlinks resolving path", path);
+  }
+}
+
+function pathFromParts(parts: string[]): string {
+  return `/${parts.join("/")}`;
+}
+
+function clampedPathFromParts(parts: string[]): string {
+  const clamped: string[] = [];
+  for (const part of parts) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      clamped.pop();
+      continue;
+    }
+    clamped.push(part);
+  }
+  return pathFromParts(clamped);
+}
+
+function childPath(db: Database, parentInode: number, leafName: string, path: string): string {
+  const parentPath = pathOf(db, parentInode);
+  if (parentPath === null) {
+    throw createWorkspaceError("ENOENT", `parent directory missing: ${path}`, path);
+  }
+  return parentPath === "/" ? `/${leafName}` : `${parentPath}/${leafName}`;
+}
+
+function pendingTargetPath(entry: WriteBufferEntry, fallback: string): string {
+  return entry.pending?.resolvedPath ?? fallback;
+}
+
+function symlinkTargetParts(target: string, linkParentParts: string[]): string[] {
+  const base = target.startsWith("/") ? [] : linkParentParts;
+  return [...base, ...target.split("/")];
+}
+
+function resolveDirectWriteTarget(
+  db: Database,
+  parts: string[],
+  canonical: string,
+  follows: SymlinkFollowState = { count: 0 },
+): DirectWriteTarget {
+  const parent = resolveParent(db, parts, canonical, follows);
+  const leafName = parts[parts.length - 1];
+  const canonicalPath =
+    parent.canonicalPath === "/" ? `/${leafName}` : `${parent.canonicalPath}/${leafName}`;
+  assertNotReadOnly(db, canonicalPath);
+  const existing = db.one<{ child_inode: number }>(
+    "SELECT child_inode FROM vfs_dirents WHERE parent_inode = ? AND name = ?",
+    parent.inode,
+    leafName,
+  );
+  return {
+    parentInode: parent.inode,
+    leafName,
+    canonicalPath,
+    ancestorInodes: parent.ancestorInodes,
+    existingInode: existing?.child_inode,
+  };
+}
+
+function resolveWriteTarget(
+  db: Database,
+  parts: string[],
+  canonical: string,
+  options: WriteFileOptions,
+): WriteTarget {
+  let targetParts = parts;
+  let targetCanonical = canonical;
+  const follows = { count: 0 };
+  assertNotReadOnly(db, canonical);
+
+  while (true) {
+    const direct = resolveDirectWriteTarget(db, targetParts, targetCanonical, follows);
+    if (direct.existingInode === undefined) {
+      return {
+        kind: "create",
+        parentInode: direct.parentInode,
+        leafName: direct.leafName,
+        canonicalPath: direct.canonicalPath,
+      };
+    }
+    if (options.exclusive) {
+      throw createWorkspaceError("EEXIST", `path exists: ${canonical}`, canonical);
+    }
+
+    const node = db.one<{ type: "file" | "dir" | "symlink"; link_target: string | null }>(
+      "SELECT type, link_target FROM vfs_nodes WHERE inode = ?",
+      direct.existingInode,
+    );
+    if (node === undefined) {
+      throw createWorkspaceError("ENOENT", `dangling dirent: ${targetCanonical}`, targetCanonical);
+    }
+    if (node.type === "dir") {
+      throw createWorkspaceError(
+        "EISDIR",
+        `path is a directory: ${targetCanonical}`,
+        targetCanonical,
+      );
+    }
+    if (node.type !== "symlink") {
+      return {
+        kind: "existing",
+        inode: direct.existingInode,
+        canonicalPath: direct.canonicalPath,
+      };
+    }
+
+    countSymlinkFollow(follows, canonical);
+    const realLinkParts = canonicalizePath(direct.canonicalPath).parts;
+    targetParts = symlinkTargetParts(node.link_target ?? "", realLinkParts.slice(0, -1));
+    targetCanonical = clampedPathFromParts(targetParts);
+    assertNotInReadOnlyMount(db, targetCanonical);
+    const finalPart = targetParts.at(-1);
+    if (finalPart === undefined || finalPart === "" || finalPart === "." || finalPart === "..") {
+      resolveParent(db, [...targetParts, "__write_target__"], targetCanonical, follows);
+      throw createWorkspaceError("EISDIR", "path is a directory", targetCanonical);
+    }
+  }
 }
 
 export function chunksOf(bytes: Uint8Array): PreparedChunk[] {
@@ -149,19 +345,9 @@ async function writeFileStreaming(
     throw createWorkspaceError("EISDIR", "cannot write to the root directory", canonical);
   }
   // Reject before we stage any blob bytes so known failures do not grow
-  // orphan blob rows that gc() then has to reap.
-  assertNotReadOnly(db, canonical);
-  if (options.exclusive) {
-    const parentInode = resolveParent(db, parts, canonical);
-    const existing = db.one(
-      "SELECT 1 FROM vfs_dirents WHERE parent_inode = ? AND name = ?",
-      parentInode,
-      parts[parts.length - 1],
-    );
-    if (existing !== undefined) {
-      throw createWorkspaceError("EEXIST", `path exists: ${canonical}`, canonical);
-    }
-  }
+  // orphan blob rows that gc() then has to reap. Resolve both lexical and
+  // effective paths so a symlink cannot defer an EROFS failure until commit.
+  resolveWriteTarget(db, parts, canonical, options);
   const mode = (options.mode ?? 0o644) & 0o7777;
   const mtime = now();
 
@@ -211,35 +397,54 @@ async function writeFileStreaming(
     flush(carry);
   }
 
-  // Wire up the inode against the staged blobs in one short
-  // transaction. From this point on the SQL is the same shape as the
-  // synchronous path — only the chunk-bytes step is skipped because
-  // stageBlob already landed them above.
-  db.transactionSync(() => {
-    const parentInode = resolveParent(db, parts, canonical);
-    const leafName = parts[parts.length - 1];
-    const existing = db.one<{ child_inode: number }>(
-      "SELECT child_inode FROM vfs_dirents WHERE parent_inode = ? AND name = ?",
-      parentInode,
-      leafName,
+  linkStagedChunksSync(db, canonical, parts, chunkRefs, { ...options, mode }, mtime);
+}
+
+// Reject a chunk list that positional reads could not address.
+// readRangeSync finds the chunk covering an offset by dividing that
+// offset by CHUNK_SIZE, and takes a chunk's start offset to be its
+// index times CHUNK_SIZE, so every chunk but the last has to fill a
+// whole window and none may overflow one. Local writers chunk with
+// chunksOf and satisfy this by construction; a chunk list that
+// arrived over sync does not have to.
+export function assertChunkWindows(chunkRefs: ChunkRef[], canonical: string): void {
+  for (let idx = 0; idx < chunkRefs.length; idx++) {
+    const { size } = chunkRefs[idx];
+    const last = idx === chunkRefs.length - 1;
+    if (size === CHUNK_SIZE || (last && size < CHUNK_SIZE)) continue;
+    throw createWorkspaceError(
+      "EINVAL",
+      `chunk ${idx} of ${chunkRefs.length} holds ${size} bytes; only the last chunk may be shorter than ${CHUNK_SIZE}: ${canonical}`,
+      canonical,
     );
-    let inode: number;
-    if (existing !== undefined) {
-      if (options.exclusive) {
-        throw createWorkspaceError("EEXIST", `path exists: ${canonical}`, canonical);
-      }
-      const node = db.one<{ type: "file" | "dir" }>(
-        "SELECT type FROM vfs_nodes WHERE inode = ?",
-        existing.child_inode,
-      );
-      if (node?.type === "dir") {
-        throw createWorkspaceError("EISDIR", `path is a directory: ${canonical}`, canonical);
-      }
-      inode = existing.child_inode;
+  }
+}
+
+// Link a path to chunks already staged in content-addressed storage.
+// This keeps payload bytes out of memory during sync apply.
+//
+// The chunk list comes from a caller that did its own chunking, so
+// the guards every other write path gets from writeFile have to run
+// here too: the read-only mount check, and the fixed-window layout
+// that positional reads depend on.
+export function linkStagedChunksSync(
+  db: Database,
+  canonical: string,
+  parts: string[],
+  chunkRefs: { hash: Uint8Array; size: number }[],
+  options: WriteFileOptions,
+  mtime: number,
+): void {
+  assertNotReadOnly(db, canonical);
+  assertChunkWindows(chunkRefs, canonical);
+  const mode = (options.mode ?? 0o644) & 0o7777;
+  db.transactionSync(() => {
+    const target = resolveWriteTarget(db, parts, canonical, options);
+    const inode = target.kind === "existing" ? target.inode : insertFileNode(db, mode, mtime);
+    if (target.kind === "existing") {
       db.run("DELETE FROM vfs_chunks WHERE inode = ?", inode);
     } else {
-      inode = insertFileNode(db, mode, mtime);
-      insertFileDirent(db, parentInode, leafName, inode, canonical);
+      insertFileDirent(db, target.parentInode, target.leafName, inode, target.canonicalPath);
     }
     for (let idx = 0; idx < chunkRefs.length; idx++) {
       const ref = chunkRefs[idx];
@@ -251,6 +456,8 @@ async function writeFileStreaming(
         ref.size,
       );
     }
+    // Referenced chunks cannot be collected, so last_seen only protects
+    // blobs during the staging window before this transaction.
     const manifestHash = buildManifest(db, chunkRefs, mtime);
     const rev = incrementRev(db);
     let totalSize = 0;
@@ -390,17 +597,8 @@ function readChunkBytes(db: Database, inode: number, idx: number): Uint8Array {
 
 function resolveFileInode(db: Database, path: string): { inode: number; mode: number } {
   const { path: canonical } = canonicalizePath(path);
-  const node = db.one<{ inode: number; type: "file" | "dir"; mode: number }>(
-    `SELECT n.inode AS inode, n.type AS type, n.mode AS mode
-       FROM vfs_nodes n
-      WHERE n.inode = (
-        SELECT child_inode
-          FROM vfs_dirents
-         WHERE parent_inode = ? AND name = ?
-      )`,
-    ...parentAndNameForResolvedPath(db, path),
-  );
-  if (node === undefined) {
+  const node = resolveInode(db, canonical);
+  if (node === null) {
     throw createWorkspaceError("ENOENT", `no such file: ${canonical}`, canonical);
   }
   if (node.type !== "file") {
@@ -409,12 +607,32 @@ function resolveFileInode(db: Database, path: string): { inode: number; mode: nu
   return { inode: node.inode, mode: node.mode };
 }
 
-function parentAndNameForResolvedPath(db: Database, path: string): [number, string] {
+function resolveWritableFileInode(
+  db: Database,
+  path: string,
+): { inode: number; mode: number; canonicalPath: string } {
   const { parts, path: canonical } = canonicalizePath(path);
   if (parts.length === 0) {
     throw createWorkspaceError("EISDIR", "cannot write to the root directory", canonical);
   }
-  return [resolveParent(db, parts, canonical), parts[parts.length - 1]];
+  const target = resolveWriteTarget(db, parts, canonical, {});
+  if (target.kind === "create") {
+    throw createWorkspaceError("ENOENT", `no such file: ${canonical}`, canonical);
+  }
+  const mode = db.scalar<number>("SELECT mode FROM vfs_nodes WHERE inode = ?", target.inode);
+  if (mode === undefined) {
+    throw createWorkspaceError("ENOENT", `no such file: ${canonical}`, canonical);
+  }
+  return { inode: target.inode, mode, canonicalPath: target.canonicalPath };
+}
+
+function directTargetForPath(db: Database, path: string): DirectWriteTarget {
+  const { parts, path: canonical } = canonicalizePath(path);
+  if (parts.length === 0) {
+    throw createWorkspaceError("EISDIR", "cannot write to the root directory", canonical);
+  }
+  assertNotReadOnly(db, canonical);
+  return resolveDirectWriteTarget(db, parts, canonical);
 }
 
 // Update an inode's chunk-backed representation in place. Iterates over
@@ -485,18 +703,12 @@ export function createFileSync(
   now: () => number,
 ): void {
   const { path: canonical } = canonicalizePath(path);
-  assertNotReadOnly(db, canonical);
-  const [parentInode, leafName] = parentAndNameForResolvedPath(db, path);
+  const target = directTargetForPath(db, path);
   const mode = (options.mode ?? 0o644) & 0o7777;
   const mtime = now();
 
   db.transactionSync(() => {
-    const existing = db.one<{ child_inode: number }>(
-      "SELECT child_inode FROM vfs_dirents WHERE parent_inode = ? AND name = ?",
-      parentInode,
-      leafName,
-    );
-    if (existing !== undefined) {
+    if (target.existingInode !== undefined) {
       throw createWorkspaceError("EEXIST", `path exists: ${canonical}`, canonical);
     }
     const rev = incrementRev(db);
@@ -510,7 +722,7 @@ export function createFileSync(
       rev,
     );
     if (row === undefined) throw createWorkspaceError("EIO", "failed to allocate inode");
-    insertFileDirent(db, parentInode, leafName, row.inode, canonical);
+    insertFileDirent(db, target.parentInode, target.leafName, row.inode, target.canonicalPath);
   });
 }
 
@@ -520,7 +732,7 @@ export function createFileSync(
 // the bytes back to chunks.
 export function openWriteBufferSync(db: Database, path: string): void {
   const { path: canonical } = canonicalizePath(path);
-  const pending = getPendingWriteBufferByPath(db, canonical);
+  const pending = findPendingWriteBuffer(db, canonical);
   if (pending !== undefined) {
     pending.openCount += 1;
     return;
@@ -556,17 +768,14 @@ export function openWriteBufferForCreateSync(
   now: () => number,
 ): void {
   const { path: canonical } = canonicalizePath(path);
-  assertNotReadOnly(db, canonical);
   if (getPendingWriteBufferByPath(db, canonical) !== undefined) {
     throw createWorkspaceError("EEXIST", `path exists: ${canonical}`, canonical);
   }
-  const [parentInode, leafName] = parentAndNameForResolvedPath(db, path);
-  const existing = db.one<{ child_inode: number }>(
-    "SELECT child_inode FROM vfs_dirents WHERE parent_inode = ? AND name = ?",
-    parentInode,
-    leafName,
-  );
-  if (existing !== undefined) {
+  const target = directTargetForPath(db, path);
+  if (
+    target.existingInode !== undefined ||
+    getPendingWriteBufferByPath(db, target.canonicalPath) !== undefined
+  ) {
     throw createWorkspaceError("EEXIST", `path exists: ${canonical}`, canonical);
   }
   const mode = (options.mode ?? 0o644) & 0o7777;
@@ -578,7 +787,15 @@ export function openWriteBufferForCreateSync(
     dirty: true,
     openCount: 1,
     mode,
-    pending: { parentInode, leafName, canonicalPath: canonical, pendingInode, mtime },
+    pending: {
+      parentInode: target.parentInode,
+      leafName: target.leafName,
+      canonicalPath: canonical,
+      resolvedPath: target.canonicalPath,
+      ancestorInodes: target.ancestorInodes,
+      pendingInode,
+      mtime,
+    },
   });
 }
 
@@ -589,7 +806,7 @@ export function openWriteBufferForCreateSync(
 // emit their INSERT + dirent + chunks in the same transaction.
 export function releaseWriteBufferSync(db: Database, path: string, now: () => number): void {
   const { path: canonical } = canonicalizePath(path);
-  const pending = getPendingWriteBufferByPath(db, canonical);
+  const pending = findPendingWriteBuffer(db, canonical);
   if (pending !== undefined) {
     releasePendingBuffer(db, pending, now);
     return;
@@ -609,31 +826,41 @@ export function releaseWriteBufferSync(db: Database, path: string, now: () => nu
   const mode = entry.mode & 0o7777;
   const buffered = entry.buf.subarray(0, entry.size);
 
-  db.transactionSync(() => {
-    if (entry.size === 0) {
-      // An empty file owns no chunk rows; clear any old ones the
-      // buffer would otherwise have replaced and bump metadata.
-      db.run("DELETE FROM vfs_chunks WHERE inode = ?", node.inode);
-      const rev = incrementRev(db);
-      db.run(
-        "UPDATE vfs_nodes SET mode = ?, mtime = ?, rev = ?, size = 0, manifest_hash = NULL WHERE inode = ?",
+  try {
+    if (entry.dirtyPath === undefined || entry.dirtyTargetPath === undefined) {
+      throw createWorkspaceError("EIO", `buffer has no writable path: ${canonical}`, canonical);
+    }
+    assertNotReadOnly(db, entry.dirtyPath);
+    assertNotReadOnly(db, entry.dirtyTargetPath);
+    db.transactionSync(() => {
+      if (entry.size === 0) {
+        // An empty file owns no chunk rows; clear any old ones the
+        // buffer would otherwise have replaced and bump metadata.
+        db.run("DELETE FROM vfs_chunks WHERE inode = ?", node.inode);
+        const rev = incrementRev(db);
+        db.run(
+          "UPDATE vfs_nodes SET mode = ?, mtime = ?, rev = ?, size = 0, manifest_hash = NULL WHERE inode = ?",
+          mode,
+          mtime,
+          rev,
+          node.inode,
+        );
+        return;
+      }
+      applyChunkedInodeUpdate(
+        db,
+        node.inode,
+        entry.size,
         mode,
         mtime,
-        rev,
-        node.inode,
+        (_idx, start, end) => start < entry.size && end > 0,
+        (_idx, start, end) => buffered.subarray(start, Math.min(end, entry.size)),
       );
-      return;
-    }
-    applyChunkedInodeUpdate(
-      db,
-      node.inode,
-      entry.size,
-      mode,
-      mtime,
-      (_idx, start, end) => start < entry.size && end > 0,
-      (_idx, start, end) => buffered.subarray(start, Math.min(end, entry.size)),
-    );
-  });
+    });
+  } catch (error) {
+    deleteWriteBuffer(db, node.inode);
+    throw error;
+  }
 
   deleteWriteBuffer(db, node.inode);
 }
@@ -655,6 +882,9 @@ function commitPendingBuffer(db: Database, entry: WriteBufferEntry, now: () => n
   let realInode = 0;
   try {
     db.transactionSync(() => {
+      assertNotReadOnly(db, canonicalPath);
+      const targetPath = childPath(db, parentInode, leafName, canonicalPath);
+      assertNotReadOnly(db, targetPath);
       // Re-check at commit time: a non-buffered writeFile or another
       // out-of-band path could have landed between open and release.
       const collision = db.one<{ child_inode: number }>(
@@ -680,7 +910,7 @@ function commitPendingBuffer(db: Database, entry: WriteBufferEntry, now: () => n
       if (row === undefined) {
         throw createWorkspaceError("EIO", "failed to allocate inode");
       }
-      insertFileDirent(db, parentInode, leafName, row.inode, canonicalPath);
+      insertFileDirent(db, parentInode, leafName, row.inode, targetPath);
       if (entry.size > 0) {
         const inode = row.inode;
         const chunkCount = Math.ceil(entry.size / CHUNK_SIZE);
@@ -712,6 +942,7 @@ function commitPendingBuffer(db: Database, entry: WriteBufferEntry, now: () => n
     throw error;
   }
   promotePendingToInode(db, pendingInode, realInode);
+  entry.dirty = false;
   return realInode;
 }
 
@@ -725,10 +956,22 @@ function commitPendingBuffer(db: Database, entry: WriteBufferEntry, now: () => n
  */
 export function flushPendingByPath(db: Database, path: string, now: () => number): boolean {
   const { path: canonical } = canonicalizePath(path);
-  const entry = getPendingWriteBufferByPath(db, canonical);
+  const entry = findPendingWriteBuffer(db, canonical);
   if (entry === undefined || entry.pending === undefined) return false;
   commitPendingBuffer(db, entry, now);
   return true;
+}
+
+/** @internal Commits pending files reached through a node before its dirent changes. */
+export function flushPendingUnderNode(db: Database, path: string, now: () => number): void {
+  const node = resolveInode(db, path, { followSymlinks: false });
+  if (node === null) return;
+
+  for (const entry of listPendingWriteBuffers(db)) {
+    if (entry.pending?.ancestorInodes.includes(node.inode)) {
+      commitPendingBuffer(db, entry, now);
+    }
+  }
 }
 
 function releasePendingBuffer(db: Database, entry: WriteBufferEntry, now: () => number): void {
@@ -782,8 +1025,9 @@ export function writeRangeSync(
 
   // Pending-create files don't have an inode yet; route the write
   // straight into the path-keyed buffer.
-  const pending = getPendingWriteBufferByPath(db, canonical);
+  const pending = findPendingWriteBuffer(db, canonical);
   if (pending !== undefined) {
+    assertNotReadOnly(db, pendingTargetPath(pending, canonical));
     const writeEnd = offset + bytes.byteLength;
     ensureBufferCapacity(pending, writeEnd);
     if (offset > pending.size) {
@@ -796,7 +1040,11 @@ export function writeRangeSync(
     return bytes.byteLength;
   }
 
-  const { inode, mode: existingMode } = resolveFileInode(db, path);
+  const {
+    inode,
+    mode: existingMode,
+    canonicalPath: targetPath,
+  } = resolveWritableFileInode(db, path);
   const mode = (options.mode ?? existingMode) & 0o7777;
   const buffered = getWriteBuffer(db, inode);
 
@@ -814,6 +1062,8 @@ export function writeRangeSync(
     if (writeEnd > buffered.size) buffered.size = writeEnd;
     buffered.mode = mode;
     buffered.dirty = true;
+    buffered.dirtyPath = canonical;
+    buffered.dirtyTargetPath = targetPath;
     return bytes.byteLength;
   }
 
@@ -859,8 +1109,9 @@ export function truncateFileSync(
   const mtime = now();
 
   // Pending-create files truncate in-place on the path-keyed buffer.
-  const pending = getPendingWriteBufferByPath(db, canonical);
+  const pending = findPendingWriteBuffer(db, canonical);
   if (pending !== undefined) {
+    assertNotReadOnly(db, pendingTargetPath(pending, canonical));
     if (size > pending.size) {
       ensureBufferCapacity(pending, size);
       pending.buf.fill(0, pending.size, size);
@@ -870,7 +1121,7 @@ export function truncateFileSync(
     return;
   }
 
-  const { inode, mode } = resolveFileInode(db, path);
+  const { inode, mode, canonicalPath: targetPath } = resolveWritableFileInode(db, path);
   const buffered = getWriteBuffer(db, inode);
 
   if (buffered !== undefined) {
@@ -881,6 +1132,8 @@ export function truncateFileSync(
     }
     buffered.size = size;
     buffered.dirty = true;
+    buffered.dirtyPath = canonical;
+    buffered.dirtyTargetPath = targetPath;
     return;
   }
 
@@ -936,33 +1189,14 @@ export function writeFileSync(
   const mtime = now();
 
   db.transactionSync(() => {
-    const parentInode = resolveParent(db, parts, canonical);
-    const leafName = parts[parts.length - 1];
-    const existing = db.one<{ child_inode: number }>(
-      "SELECT child_inode FROM vfs_dirents WHERE parent_inode = ? AND name = ?",
-      parentInode,
-      leafName,
-    );
-
-    let inode: number;
-    if (existing !== undefined) {
-      if (options.exclusive) {
-        throw createWorkspaceError("EEXIST", `path exists: ${canonical}`, canonical);
-      }
-      const node = db.one<{ type: "file" | "dir" }>(
-        "SELECT type FROM vfs_nodes WHERE inode = ?",
-        existing.child_inode,
-      );
-      if (node?.type === "dir") {
-        throw createWorkspaceError("EISDIR", `path is a directory: ${canonical}`, canonical);
-      }
-      inode = existing.child_inode;
+    const target = resolveWriteTarget(db, parts, canonical, options);
+    const inode = target.kind === "existing" ? target.inode : insertFileNode(db, mode, mtime);
+    if (target.kind === "existing") {
       // Replace the existing representation. Orphaned blobs (if any)
       // are cleaned up by a later gc() pass.
       db.run("DELETE FROM vfs_chunks WHERE inode = ?", inode);
     } else {
-      inode = insertFileNode(db, mode, mtime);
-      insertFileDirent(db, parentInode, leafName, inode, canonical);
+      insertFileDirent(db, target.parentInode, target.leafName, inode, target.canonicalPath);
     }
 
     const rev = incrementRev(db);
@@ -1010,29 +1244,13 @@ export function writeFileRangesSync(
   const ranges = normalizeRanges(dirtyRanges, bytes.byteLength);
   const mtime = now();
   db.transactionSync(() => {
-    const parentInode = resolveParent(db, parts, canonical);
-    const leafName = parts[parts.length - 1];
-    const existing = db.one<{ child_inode: number }>(
-      "SELECT child_inode FROM vfs_dirents WHERE parent_inode = ? AND name = ?",
-      parentInode,
-      leafName,
-    );
-
-    let inode: number;
+    const target = resolveWriteTarget(db, parts, canonical, options);
+    const inode = target.kind === "existing" ? target.inode : insertFileNode(db, mode, mtime);
     let oldChunks: ChunkRef[] = [];
-    if (existing !== undefined) {
-      const node = db.one<{ type: "file" | "dir" }>(
-        "SELECT type FROM vfs_nodes WHERE inode = ?",
-        existing.child_inode,
-      );
-      if (node?.type === "dir") {
-        throw createWorkspaceError("EISDIR", `path is a directory: ${canonical}`, canonical);
-      }
-      inode = existing.child_inode;
+    if (target.kind === "existing") {
       oldChunks = existingChunkRefs(db, inode);
     } else {
-      inode = insertFileNode(db, mode, mtime);
-      insertFileDirent(db, parentInode, leafName, inode, canonical);
+      insertFileDirent(db, target.parentInode, target.leafName, inode, target.canonicalPath);
     }
 
     const rev = incrementRev(db);

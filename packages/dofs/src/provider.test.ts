@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { invalidateReadOnlyMountCache } from "./fs/mount-guard.js";
 import { withDB } from "./fs/with-db.js";
 import { SQLiteWorkspaceProvider } from "./provider.js";
 import type { Database } from "./storage.js";
@@ -689,6 +690,134 @@ describe("SQLiteWorkspaceProvider — pending-create flush on rename/link/unlink
 
       expect((p.readFileSync("/to.txt") as Buffer).toString()).toBe("moved");
       expect(p.existsSync("/from.txt")).toBe(false);
+    });
+  });
+
+  it("renameSync commits pending descendants before moving a directory", async () => {
+    await withProvider((p) => {
+      p.mkdirSync("/old");
+      p.openWriteBufferForCreateSync("/old/pending.txt", { mode: 0o644 });
+      p.writeRangeSync("/old/pending.txt", Buffer.from("pending"), 0);
+
+      p.renameSync("/old", "/new");
+
+      expect((p.readFileSync("/new/pending.txt") as Buffer).toString()).toBe("pending");
+      expect(() =>
+        p.openWriteBufferForCreateSync("/new/pending.txt", { mode: 0o644 }),
+      ).toThrowError(expect.objectContaining({ code: "EEXIST" }));
+      expect(() => p.releaseWriteBufferSync("/new/pending.txt")).not.toThrow();
+    });
+  });
+
+  it("renameSync commits lexical pending descendants reached through symlinks", async () => {
+    await withProvider((p) => {
+      p.mkdirSync("/src");
+      p.mkdirSync("/outside");
+      p.symlinkSync("/outside", "/src/link");
+      p.openWriteBufferForCreateSync("/src/link/pending.txt", { mode: 0o644 });
+      p.writeRangeSync("/src/link/pending.txt", Buffer.from("pending"), 0);
+
+      p.renameSync("/src", "/new");
+
+      expect((p.readFileSync("/new/link/pending.txt") as Buffer).toString()).toBe("pending");
+      expect(() => p.releaseWriteBufferSync("/new/link/pending.txt")).not.toThrow();
+    });
+  });
+
+  it("renameSync commits pending descendants created through another directory alias", async () => {
+    await withProvider((p) => {
+      p.mkdirSync("/real/src", { recursive: true });
+      p.mkdirSync("/outside");
+      p.symlinkSync("/real", "/alias");
+      p.symlinkSync("/outside", "/real/src/link");
+      p.openWriteBufferForCreateSync("/real/src/link/pending.txt", { mode: 0o644 });
+      p.writeRangeSync("/real/src/link/pending.txt", Buffer.from("pending"), 0);
+
+      p.renameSync("/alias/src", "/new");
+
+      expect((p.readFileSync("/new/link/pending.txt") as Buffer).toString()).toBe("pending");
+      expect(() => p.releaseWriteBufferSync("/new/link/pending.txt")).not.toThrow();
+    });
+  });
+
+  it("renameSync finds a pending file through another parent alias", async () => {
+    await withProvider((p) => {
+      p.mkdirSync("/real");
+      p.symlinkSync("/real", "/a");
+      p.symlinkSync("/real", "/b");
+      p.openWriteBufferForCreateSync("/a/pending.txt", { mode: 0o644 });
+      p.writeRangeSync("/a/pending.txt", Buffer.from("pending"), 0);
+
+      p.renameSync("/b/pending.txt", "/moved.txt");
+
+      expect((p.readFileSync("/moved.txt") as Buffer).toString()).toBe("pending");
+      expect(() => p.releaseWriteBufferSync("/moved.txt")).not.toThrow();
+    });
+  });
+
+  it("renameSync commits pending files reached through the renamed symlink", async () => {
+    await withProvider((p) => {
+      p.mkdirSync("/one");
+      p.symlinkSync("/one", "/link");
+      p.openWriteBufferForCreateSync("/link/pending.txt", { mode: 0o644 });
+      p.writeRangeSync("/link/pending.txt", Buffer.from("pending"), 0);
+
+      p.renameSync("/link", "/newlink");
+
+      expect((p.readFileSync("/newlink/pending.txt") as Buffer).toString()).toBe("pending");
+      expect(() => p.releaseWriteBufferSync("/newlink/pending.txt")).not.toThrow();
+    });
+  });
+
+  it("unlinkSync commits pending files before a traversed symlink is replaced", async () => {
+    await withProvider((p) => {
+      p.mkdirSync("/one");
+      p.mkdirSync("/two");
+      p.symlinkSync("/one", "/link");
+      p.openWriteBufferForCreateSync("/link/pending.txt", { mode: 0o644 });
+      p.writeRangeSync("/link/pending.txt", Buffer.from("pending"), 0);
+
+      p.unlinkSync("/link");
+      p.symlinkSync("/two", "/link");
+
+      expect((p.readFileSync("/one/pending.txt") as Buffer).toString()).toBe("pending");
+      expect(p.existsSync("/two/pending.txt")).toBe(false);
+      expect(() => p.releaseWriteBufferSync("/one/pending.txt")).not.toThrow();
+    });
+  });
+
+  it("does not flush an unrelated uncommittable pending create", async () => {
+    await withProviderAndDB((p, db) => {
+      p.mkdirSync("/a");
+      p.mkdirSync("/b");
+      p.openWriteBufferForCreateSync("/a/pending.txt", { mode: 0o644 });
+      p.writeRangeSync("/a/pending.txt", Buffer.from("pending"), 0);
+      db.run(
+        "INSERT INTO _vfs_mounts (root, kind, indexed, mode) VALUES (?, ?, 1, ?)",
+        "/a",
+        "test",
+        "read-only",
+      );
+      invalidateReadOnlyMountCache(db);
+
+      expect(() => p.renameSync("/b", "/c")).not.toThrow();
+      expect(p.existsSync("/b")).toBe(false);
+      expect(p.existsSync("/c")).toBe(true);
+      expect((p.readFileSync("/a/pending.txt") as Buffer).toString()).toBe("pending");
+    });
+  });
+
+  it("rmdirSync preserves pending descendants", async () => {
+    await withProvider((p) => {
+      p.mkdirSync("/dir");
+      p.openWriteBufferForCreateSync("/dir/pending.txt", { mode: 0o644 });
+      p.writeRangeSync("/dir/pending.txt", Buffer.from("pending"), 0);
+
+      expect(() => p.rmdirSync("/dir")).toThrowError(
+        expect.objectContaining({ code: "ENOTEMPTY" }),
+      );
+      expect((p.readFileSync("/dir/pending.txt") as Buffer).toString()).toBe("pending");
+      expect(() => p.releaseWriteBufferSync("/dir/pending.txt")).not.toThrow();
     });
   });
 

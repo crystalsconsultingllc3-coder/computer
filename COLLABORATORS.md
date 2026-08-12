@@ -144,11 +144,17 @@ Once your pull request merges to `main`, the release workflow takes
 over in two steps:
 
 1. It gathers the pending changesets into a "Version Packages" pull
-   request that bumps package versions, rewrites changelogs, and updates
-   Dockerfile and documentation pins for the `computerd` image. Private
-   packages such as `@cloudflare/dofs`, `@cloudflare/computer-rpc`, and
-   `@cloudflare/computerd` are versioned and get changelogs, but are not
-   published to npm.
+   request from the `release` branch. That pull request advances
+   `@cloudflare/computer`, its private implementation packages, and the
+   derivative image package to the same version, rewrites changelogs, and
+   updates Dockerfile and documentation pins for the `computerd` image.
+   Private packages such as `@cloudflare/dofs`,
+   `@cloudflare/computer-rpc`, and `@cloudflare/computerd` are versioned and
+   get changelogs, but are not published to npm. Each update publishes a
+   package preview through
+   `pkg.pr.new` and the mutable
+   `ghcr.io/cloudflare/computer-computerd-linux-x64:next` image after CI
+   passes.
 2. Merging that pull request first builds and pushes the `computerd`
    binary image to `ghcr.io` and `registry.cloudflare.com`, then publishes
    public npm packages. Rerunning a failed publish is safe: existing image

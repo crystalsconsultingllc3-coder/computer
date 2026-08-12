@@ -4,6 +4,7 @@ import { ROOT_INODE } from "../schema/index.js";
 import type { Database } from "../storage.js";
 import { mkdir } from "./mkdir.js";
 import { resolveInode } from "./resolve.js";
+import { symlink } from "./symlink.js";
 import { withDB } from "./with-db.js";
 import { CHUNK_SIZE, writeFile, writeFileRangesSync, writeFileSync } from "./writeFile.js";
 
@@ -274,6 +275,16 @@ describe("writeFile", () => {
     });
   });
 
+  it("rejects ENOTDIR when a deep parent path segment is a file", async () => {
+    await withDB(async (db) => {
+      await writeFile(db, "/target", "file", {}, () => 0);
+
+      await expect(
+        writeFile(db, "/target/sub/child.txt", "hello", {}, () => 0),
+      ).rejects.toMatchObject({ code: "ENOTDIR" });
+    });
+  });
+
   it("rejects EISDIR when the path resolves to a directory", async () => {
     await withDB(async (db) => {
       mkdir(db, "/d", {}, () => 0);
@@ -317,6 +328,223 @@ describe("writeFile", () => {
       mkdir(db, "/a/b", { recursive: true }, () => 0);
       await writeFile(db, "/a/b/c.txt", "nested", {}, () => 0);
       expect(new TextDecoder().decode(readBack(db, "/a/b/c.txt"))).toBe("nested");
+    });
+  });
+
+  it("writes through an intermediate symlink to a directory", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/real", {}, () => 0);
+      symlink(db, "/real", "/linkdir", () => 0);
+
+      await writeFile(db, "/linkdir/file.txt", "hello", {}, () => 0);
+
+      expect(new TextDecoder().decode(readBack(db, "/real/file.txt"))).toBe("hello");
+    });
+  });
+
+  it("invalidates a cached miss at the resolved path after writing through a symlinked parent", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/real", {}, () => 0);
+      symlink(db, "/real", "/linkdir", () => 0);
+      expect(resolveInode(db, "/real/file.txt")).toBeNull();
+
+      await writeFile(db, "/linkdir/file.txt", "hello", {}, () => 0);
+
+      expect(new TextDecoder().decode(readBack(db, "/real/file.txt"))).toBe("hello");
+    });
+  });
+
+  it("writes through an intermediate relative symlink to a directory", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/base/real", { recursive: true }, () => 0);
+      symlink(db, "real", "/base/linkdir", () => 0);
+
+      await writeFile(db, "/base/linkdir/file.txt", "hello", {}, () => 0);
+
+      expect(new TextDecoder().decode(readBack(db, "/base/real/file.txt"))).toBe("hello");
+    });
+  });
+
+  it("resolves a relative final symlink from its real parent", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/real/nested", { recursive: true }, () => 0);
+      symlink(db, "/real/nested", "/alias", () => 0);
+      symlink(db, "../target", "/real/nested/link", () => 0);
+
+      await writeFile(db, "/alias/link", "hello", {}, () => 0);
+
+      expect(new TextDecoder().decode(readBack(db, "/real/target"))).toBe("hello");
+      expect(new TextDecoder().decode(readBack(db, "/alias/link"))).toBe("hello");
+      expect(resolveInode(db, "/target")).toBeNull();
+    });
+  });
+
+  it("expands a symlink before applying a later parent segment in its target", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/base/dir", { recursive: true }, () => 0);
+      mkdir(db, "/other/deep", { recursive: true }, () => 0);
+      symlink(db, "/other/deep", "/base/dir/alias", () => 0);
+      symlink(db, "alias/../target", "/base/dir/link", () => 0);
+
+      await writeFile(db, "/base/dir/link", "hello", {}, () => 0);
+
+      expect(new TextDecoder().decode(readBack(db, "/other/target"))).toBe("hello");
+      expect(new TextDecoder().decode(readBack(db, "/base/dir/link"))).toBe("hello");
+      expect(resolveInode(db, "/base/dir/target")).toBeNull();
+    });
+  });
+
+  it("rejects ENOTDIR when an intermediate symlink resolves to a file", async () => {
+    await withDB(async (db) => {
+      await writeFile(db, "/target", "file", {}, () => 0);
+      symlink(db, "/target", "/linkfile", () => 0);
+
+      await expect(
+        writeFile(db, "/linkfile/child.txt", "hello", {}, () => 0),
+      ).rejects.toMatchObject({
+        code: "ENOTDIR",
+      });
+    });
+  });
+
+  it("rejects ELOOP when an intermediate symlink is cyclic", async () => {
+    await withDB(async (db) => {
+      symlink(db, "/b", "/a", () => 0);
+      symlink(db, "/a", "/b", () => 0);
+
+      await expect(writeFile(db, "/a/child.txt", "hello", {}, () => 0)).rejects.toMatchObject({
+        code: "ELOOP",
+      });
+    });
+  });
+
+  it("counts intermediate and final symlinks against one follow limit", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/real", {}, () => 0);
+      for (let index = 29; index >= 0; index--) {
+        const target = index === 29 ? "/real" : `/dir-${index + 1}`;
+        symlink(db, target, `/dir-${index}`, () => 0);
+      }
+      for (let index = 19; index >= 0; index--) {
+        const target = index === 19 ? "/missing" : `/file-${index + 1}`;
+        symlink(db, target, `/file-${index}`, () => 0);
+      }
+      symlink(db, "/file-0", "/real/link", () => 0);
+
+      await expect(writeFile(db, "/dir-0/link", "hello", {}, () => 0)).rejects.toMatchObject({
+        code: "ELOOP",
+      });
+      expect(resolveInode(db, "/missing")).toBeNull();
+    });
+  });
+
+  it("writes through a final symlink to its target", async () => {
+    await withDB(async (db) => {
+      await writeFile(db, "/target", "old", {}, () => 0);
+      symlink(db, "/target", "/link", () => 0);
+
+      await writeFile(db, "/link", "new", {}, () => 0);
+
+      expect(new TextDecoder().decode(readBack(db, "/target"))).toBe("new");
+      expect(new TextDecoder().decode(readBack(db, "/link"))).toBe("new");
+      expect(
+        db.scalar<number>(
+          "SELECT COUNT(*) FROM vfs_chunks c JOIN vfs_nodes n ON n.inode = c.inode WHERE n.type = 'symlink'",
+        ),
+      ).toBe(0);
+      expect(db.scalar<number>("SELECT size FROM vfs_nodes WHERE type = 'symlink'")).toBe(0);
+    });
+  });
+
+  it("creates the target when writing through a dangling final symlink", async () => {
+    await withDB(async (db) => {
+      symlink(db, "/created", "/link", () => 0);
+
+      await writeFile(db, "/link", "new", {}, () => 0);
+
+      expect(new TextDecoder().decode(readBack(db, "/created"))).toBe("new");
+    });
+  });
+
+  it("creates a relative target from the symlink parent when writing through a dangling final symlink", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/dir", {}, () => 0);
+      symlink(db, "created", "/dir/link", () => 0);
+
+      await writeFile(db, "/dir/link", "new", {}, () => 0);
+
+      expect(new TextDecoder().decode(readBack(db, "/dir/created"))).toBe("new");
+    });
+  });
+
+  it("clamps final symlink targets that climb above the root", async () => {
+    await withDB(async (db) => {
+      symlink(db, "../../created", "/link", () => 0);
+
+      await writeFile(db, "/link", "new", {}, () => 0);
+
+      expect(new TextDecoder().decode(readBack(db, "/created"))).toBe("new");
+      expect(new TextDecoder().decode(readBack(db, "/link"))).toBe("new");
+    });
+  });
+
+  it("clamps intermediate symlink targets that climb above the root", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/real", {}, () => 0);
+      symlink(db, "../../real", "/linkdir", () => 0);
+
+      await writeFile(db, "/linkdir/file.txt", "new", {}, () => 0);
+
+      expect(new TextDecoder().decode(readBack(db, "/real/file.txt"))).toBe("new");
+    });
+  });
+
+  it("creates the missing target at the end of a dangling symlink chain", async () => {
+    await withDB(async (db) => {
+      symlink(db, "/mid", "/link", () => 0);
+      symlink(db, "/missing", "/mid", () => 0);
+
+      await writeFile(db, "/link", "new", {}, () => 0);
+
+      expect(new TextDecoder().decode(readBack(db, "/missing"))).toBe("new");
+      expect(resolveInode(db, "/mid", { followSymlinks: false })?.type).toBe("symlink");
+    });
+  });
+
+  it("keeps exclusive writes on a final symlink from following the link", async () => {
+    await withDB(async (db) => {
+      await writeFile(db, "/target", "old", {}, () => 0);
+      symlink(db, "/target", "/link", () => 0);
+
+      await expect(
+        writeFile(db, "/link", "new", { exclusive: true }, () => 0),
+      ).rejects.toMatchObject({
+        code: "EEXIST",
+      });
+      expect(new TextDecoder().decode(readBack(db, "/target"))).toBe("old");
+    });
+  });
+
+  it("range writes follow a final symlink", async () => {
+    await withDB(async (db) => {
+      await writeFile(db, "/target", "abc", {}, () => 0);
+      symlink(db, "/target", "/link", () => 0);
+
+      writeFileRangesSync(
+        db,
+        "/link",
+        new TextEncoder().encode("axc"),
+        [{ start: 1, end: 2 }],
+        {},
+        () => 0,
+      );
+
+      expect(new TextDecoder().decode(readBack(db, "/target"))).toBe("axc");
+      expect(
+        db.scalar<number>(
+          "SELECT COUNT(*) FROM vfs_chunks c JOIN vfs_nodes n ON n.inode = c.inode WHERE n.type = 'symlink'",
+        ),
+      ).toBe(0);
     });
   });
 

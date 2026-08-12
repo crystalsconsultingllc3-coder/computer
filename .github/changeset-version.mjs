@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Called by the changesets action in release.yml as the `version`
-// command. It consumes pending changesets, then applies release-time
-// references that must be committed with the Version Packages PR.
+// Called by the version path in release.yml. It consumes pending changesets,
+// then applies release-time references that must be committed with the Version
+// Packages PR.
 //
 // Changesets owns package versions and changelogs, including private
 // packages (`privatePackages.version` is enabled in .changeset/config.json).

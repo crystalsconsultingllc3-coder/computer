@@ -18,6 +18,9 @@ export interface FileStat {
 }
 
 export interface FileStore {
+  /** Shared identity used to coordinate mutations across adapters. */
+  readonly lockIdentity?: object;
+
   /** Return file metadata, or null if the path does not exist or is not a file. */
   stat(path: string): Promise<FileStat | null>;
 
@@ -42,4 +45,9 @@ export interface FileStore {
    * overwrite.
    */
   write(path: string, content: Uint8Array, opts?: { mode?: number }): Promise<void>;
+}
+
+export interface MutableFileStore extends FileStore {
+  /** Remove a file or directory. */
+  remove(path: string, opts?: { recursive?: boolean; force?: boolean }): Promise<void>;
 }

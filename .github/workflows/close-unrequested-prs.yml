@@ -5,7 +5,9 @@ on:
     types: [opened, reopened]
 
 permissions:
-  contents: read
+  # push-level access needed by the collaborator-permission API
+  # otherwise `author_association` is unreliable for private org members.
+  contents: write
   issues: write
   pull-requests: write
 
@@ -21,7 +23,7 @@ jobs:
             const pull_number = context.payload.pull_request.number;
             const issue_number = pull_number;
             const allowedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
-            const allowedBots = new Set(['dependabot[bot]', 'renovate[bot]', 'github-actions[bot]']);
+            const allowedBots = new Set(['agent-think[bot]', 'dependabot[bot]', 'github-actions[bot]', 'renovate[bot]']);
             const allowedLabels = new Set(['allow-pr']);
 
             const { data: pullRequest } = await github.rest.pulls.get({

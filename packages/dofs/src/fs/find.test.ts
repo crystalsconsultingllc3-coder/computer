@@ -54,6 +54,17 @@ describe("find", () => {
     });
   });
 
+  it("matches ? as one non-separator character", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/a", {}, () => 0);
+      await writeFile(db, "/a/a.ts", "", {}, () => 0);
+      await writeFile(db, "/a/ab.ts", "", {}, () => 0);
+      await writeFile(db, "/a/b.ts", "", {}, () => 0);
+      const paths = find(db, "/a", "?.ts").map((entry) => entry.path);
+      expect(paths).toEqual(["/a/a.ts", "/a/b.ts"]);
+    });
+  });
+
   it("matches ** recursively", async () => {
     await withDB(async (db) => {
       mkdir(db, "/a/b/c", { recursive: true }, () => 0);
@@ -76,6 +87,21 @@ describe("find", () => {
         .map((e) => e.path)
         .sort();
       expect(paths).toEqual(["/a/b/c/z.ts", "/a/b/y.ts"]);
+    });
+  });
+
+  it("applies limit and offset while walking in deterministic order", async () => {
+    await withDB(async (db) => {
+      mkdir(db, "/a/b", { recursive: true }, () => 0);
+      await writeFile(db, "/a/1.ts", "", {}, () => 0);
+      await writeFile(db, "/a/b/2.ts", "", {}, () => 0);
+      await writeFile(db, "/a/b/3.ts", "", {}, () => 0);
+      await writeFile(db, "/a/z.ts", "", {}, () => 0);
+
+      expect(find(db, "/a", "**/*.ts", { offset: 1, limit: 2 })).toEqual([
+        { path: "/a/b/2.ts", type: "file" },
+        { path: "/a/b/3.ts", type: "file" },
+      ]);
     });
   });
 

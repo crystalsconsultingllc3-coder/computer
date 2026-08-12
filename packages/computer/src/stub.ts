@@ -41,6 +41,7 @@
 
 import { trackStub, untrackStub } from "@cloudflare/computer-rpc/debug";
 import type {
+  FindOptions,
   GrepOptions,
   MkdirOptions,
   ReaddirOptions,
@@ -104,6 +105,11 @@ export class WorkspaceFilesystemStub extends RpcTarget {
 
   readFile(path: string): Promise<ReadableStream<Uint8Array>>;
   readFile(path: string, encoding: "utf8"): Promise<string>;
+  readFile(
+    path: string,
+    options: ReadFileOptions & { encoding?: undefined },
+  ): Promise<ReadableStream<Uint8Array>>;
+  readFile(path: string, options: ReadFileOptions & { encoding: "utf8" }): Promise<string>;
   readFile(path: string, options: ReadFileOptions): Promise<string | ReadableStream<Uint8Array>>;
   readFile(
     path: string,
@@ -185,12 +191,16 @@ export class WorkspaceFilesystemStub extends RpcTarget {
     );
   }
 
-  find(directory: string, pattern?: string): Promise<WorkspaceFoundEntry[]> {
+  find(
+    directory: string,
+    pattern?: string,
+    options: FindOptions = {},
+  ): Promise<WorkspaceFoundEntry[]> {
     return withSpan(
       this.#ws.observer,
       "workspace.fs.find",
       { "workspace.fs.path": directory, "workspace.fs.pattern": pattern },
-      () => this.#ws.fs.find(directory, pattern),
+      () => this.#ws.fs.find(directory, pattern, options),
       (span, outcome) => {
         if (outcome.ok) span.setAttribute("workspace.fs.matches", outcome.value.length);
       },

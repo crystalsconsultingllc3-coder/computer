@@ -1,6 +1,9 @@
 import type { ToolSet } from "ai";
 import { createExecTool, type ExecToolOptions, type ExecWorkspaceLike } from "./exec.js";
+import { createDeleteTool } from "./fs/delete.js";
 import { createEditTool, type EditToolOptions } from "./fs/edit.js";
+import { createFindTool } from "./fs/find.js";
+import { createGrepTool } from "./fs/grep.js";
 import { createListTool } from "./fs/list.js";
 import { createReadTool, type ReadToolOptions } from "./fs/read.js";
 import { type WorkspaceLike as FileWorkspaceLike, WorkspaceFileStore } from "./fs/store.js";
@@ -22,12 +25,15 @@ export function createAITools(options: CreateAIToolsOptions): ToolSet {
   const tools: ToolSet = {
     read: createReadTool({ store, ...options.read }),
     ls: createListTool({ workspace: options.workspace }),
+    find: createFindTool({ workspace: options.workspace }),
+    grep: createGrepTool({ workspace: options.workspace }),
   };
 
   if (options.readonly === true) return tools;
 
   tools.write = createWriteTool({ store, ...options.write });
   tools.edit = createEditTool({ store, ...options.edit });
+  tools.delete = createDeleteTool({ store });
 
   if (options.shell !== undefined) {
     tools.exec = createExecTool({

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { grep } from "./grep.js";
 import { mkdir } from "./mkdir.js";
@@ -43,11 +43,125 @@ describe("grep", () => {
     });
   });
 
-  it("respects ignoreCase", async () => {
+  it("respects the ignoreCase option", async () => {
     await withDB(async (db) => {
       await writeFile(db, "/a.txt", "todo\nTODO\nTodo\n", {}, () => 0);
       expect((await grep(db, "TODO", "/a.txt", { ignoreCase: true })).length).toBe(3);
+      expect((await grep(db, "TODO", "/a.txt", { ignoreCase: false })).length).toBe(1);
       expect((await grep(db, "TODO", "/a.txt")).length).toBe(1);
+    });
+  });
+
+  it("supports opt-in regular expressions and literal strings by default", async () => {
+    await withDB(async (db) => {
+      await writeFile(db, "/a.txt", "task 12\ntask \\d+\ntask xx\n", {}, () => 0);
+      expect(
+        (await grep(db, String.raw`task \d+`, "/a.txt", { regex: true })).map(
+          (match) => match.line,
+        ),
+      ).toEqual([1]);
+      expect((await grep(db, String.raw`task \d+`, "/a.txt")).map((match) => match.line)).toEqual([
+        2,
+      ]);
+      await expect(grep(db, "[", "/a.txt", { regex: true })).rejects.toThrow(
+        "Invalid regular expression",
+      );
+    });
+  });
+
+  it("returns numbered context around matches", async () => {
+    await withDB(async (db) => {
+      await writeFile(db, "/a.txt", "one\ntwo\nTODO\nfour\nfive\n", {}, () => 0);
+      expect(await grep(db, "TODO", "/a.txt", { context: 1 })).toEqual([
+        {
+          path: "/a.txt",
+          line: 3,
+          text: "TODO",
+          context: [
+            { line: 2, text: "two", isMatch: false },
+            { line: 3, text: "TODO", isMatch: true },
+            { line: 4, text: "four", isMatch: false },
+          ],
+        },
+      ]);
+    });
+  });
+
+  it("marks adjacent matches as matching context", async () => {
+    await withDB(async (db) => {
+      await writeFile(db, "/a.txt", "TODO one\nTODO two\nplain\n", {}, () => 0);
+
+      const matches = await grep(db, "TODO", "/a.txt", { context: 1 });
+      expect(matches).toEqual([
+        {
+          path: "/a.txt",
+          line: 1,
+          text: "TODO one",
+          context: [
+            { line: 1, text: "TODO one", isMatch: true },
+            { line: 2, text: "TODO two", isMatch: true },
+          ],
+        },
+        {
+          path: "/a.txt",
+          line: 2,
+          text: "TODO two",
+          context: [
+            { line: 1, text: "TODO one", isMatch: true },
+            { line: 2, text: "TODO two", isMatch: true },
+            { line: 3, text: "plain", isMatch: false },
+          ],
+        },
+      ]);
+
+      if (matches[0].context === undefined || matches[1].context === undefined) {
+        throw new Error("expected grep context");
+      }
+      matches[0].context[0].text = "changed";
+      expect(matches[1].context[0].text).toBe("TODO one");
+    });
+  });
+
+  it("applies offset and limit across files in path and line order", async () => {
+    await withDB(async (db) => {
+      await writeFile(db, "/a.txt", "TODO a1\nTODO a2\n", {}, () => 0);
+      await writeFile(db, "/b.txt", "TODO b1\nTODO b2\n", {}, () => 0);
+      expect(
+        (await grep(db, "TODO", "/", { offset: 1, limit: 2 })).map(
+          (match) => `${match.path}:${match.line}`,
+        ),
+      ).toEqual(["/a.txt:2", "/b.txt:1"]);
+    });
+  });
+
+  it("filters directory searches by an include glob before applying pagination", async () => {
+    await withDB(async (db) => {
+      await writeFile(db, "/a.md", "TODO markdown\n", {}, () => 0);
+      await writeFile(db, "/b.ts", "TODO one\nTODO two\n", {}, () => 0);
+      await writeFile(db, "/c.ts", "TODO three\n", {}, () => 0);
+
+      expect(
+        (await grep(db, "TODO", "/", { include: "**/*.ts", offset: 1, limit: 2 })).map(
+          (match) => `${match.path}:${match.line}`,
+        ),
+      ).toEqual(["/b.ts:2", "/c.ts:1"]);
+    });
+  });
+
+  it("walks each directory page once during a search", async () => {
+    await withDB(async (db) => {
+      for (let index = 0; index < 260; index += 1) {
+        await writeFile(db, `/file-${String(index).padStart(3, "0")}.txt`, "plain\n", {}, () => 0);
+      }
+      const all = vi.spyOn(db, "all");
+
+      expect(await grep(db, "missing", "/", { include: "*.txt", limit: 1 })).toEqual([]);
+
+      const childPageQueries = all.mock.calls.filter(([query]) =>
+        String(query).includes("d.name > ?"),
+      );
+      expect(childPageQueries.length).toBeGreaterThan(1);
+      expect(childPageQueries.filter(([, , afterName]) => afterName === "")).toHaveLength(1);
     });
   });
 

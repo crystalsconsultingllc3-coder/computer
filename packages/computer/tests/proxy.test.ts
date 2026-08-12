@@ -54,6 +54,26 @@ describe("WorkspaceProxy", () => {
     expect(await websocket.text()).toBe(`from-do:${token}`);
   });
 
+  it("routes egress callbacks through /ws while preserving the original request", async () => {
+    const res = await SELF.fetch("https://api.example.test/v1/data?format=json", {
+      method: "POST",
+      body: "payload",
+      headers: {
+        "content-type": "text/plain",
+        "x-test-id": freshId(),
+        "x-test-egress-token": "secret-token",
+      },
+    });
+
+    expect(await res.json()).toEqual({
+      callbackUrl: "https://api.example.test/ws",
+      originalUrl: "https://api.example.test/v1/data?format=json",
+      egressToken: "secret-token",
+      method: "POST",
+      body: "payload",
+    });
+  });
+
   it("/ws returns 500 when env[binding] is missing", async () => {
     const res = await SELF.fetch("http://proxy.test/ws", {
       headers: { "x-test-id": freshId(), "x-test-binding": "NOT_A_BINDING" },

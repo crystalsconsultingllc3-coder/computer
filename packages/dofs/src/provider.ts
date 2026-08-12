@@ -12,6 +12,7 @@ import { getBlobBytes } from "./fs/blobCache.js";
 import { link as linkImpl } from "./fs/link.js";
 import type { MkdirOptions } from "./fs/mkdir.js";
 import { mkdir as mkdirImpl } from "./fs/mkdir.js";
+import { findPendingWriteBuffer } from "./fs/pendingWriteBuffer.js";
 import { readdir as readdirImpl } from "./fs/readdir.js";
 import { readRangeSync as readRangeSyncImpl } from "./fs/readFile.js";
 import { readlink as readlinkImpl } from "./fs/readlink.js";
@@ -27,14 +28,11 @@ import {
   type WatchHandle,
   type WatchOptions,
 } from "./fs/watch.js";
-import {
-  deleteWriteBuffer,
-  getPendingWriteBufferByPath,
-  getWriteBuffer,
-} from "./fs/writeBuffer.js";
+import { deleteWriteBuffer, getWriteBuffer } from "./fs/writeBuffer.js";
 import {
   createFileSync as createFileSyncImpl,
   flushPendingByPath,
+  flushPendingUnderNode,
   openWriteBufferForCreateSync as openWriteBufferForCreateSyncImpl,
   openWriteBufferSync as openWriteBufferSyncImpl,
   releaseWriteBufferSync as releaseWriteBufferSyncImpl,
@@ -197,8 +195,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   lstatSync(path: string, _options?: { bigint?: boolean }): VirtualStatsLike {
-    const { path: canonical } = canonicalizePath(path);
-    const pending = getPendingWriteBufferByPath(this.db, canonical);
+    const pending = findPendingWriteBuffer(this.db, path);
     if (pending !== undefined && pending.pending !== undefined) {
       return wrapStats({
         mode: pending.mode & 0o7777,
@@ -263,6 +260,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   rmdirSync(path: string): void {
+    flushPendingUnderNode(this.db, path, this.now);
     rmImpl(this.db, path, {});
   }
 
@@ -277,6 +275,7 @@ export class SQLiteWorkspaceProvider {
     // resulting GC sees the orphaned blob, matching the non-buffered
     // shape). The buffer's open handles continue to address bytes
     // through the inode-keyed cache.
+    flushPendingUnderNode(this.db, path, this.now);
     flushPendingByPath(this.db, path, this.now);
     // Capture the target inode before rm runs so we can evict its
     // write-buffer cache entry if rm removed the last link. Without
@@ -323,6 +322,8 @@ export class SQLiteWorkspaceProvider {
     // touches dirents: the source needs a real inode to move, and a
     // pending buffer at the destination would otherwise slip past
     // rename's dirent-based existence check and lose bytes on release.
+    flushPendingUnderNode(this.db, oldPath, this.now);
+    flushPendingUnderNode(this.db, newPath, this.now);
     flushPendingByPath(this.db, oldPath, this.now);
     flushPendingByPath(this.db, newPath, this.now);
     // Capture the destination inode before the rename so we can evict
@@ -356,8 +357,7 @@ export class SQLiteWorkspaceProvider {
     options?: BufferEncoding | { encoding?: BufferEncoding | null } | null,
   ): Buffer | string {
     const encoding = typeof options === "string" ? options : options?.encoding;
-    const { path: canonical } = canonicalizePath(path);
-    const pending = getPendingWriteBufferByPath(this.db, canonical);
+    const pending = findPendingWriteBuffer(this.db, path);
     if (pending !== undefined) {
       const snapshot = Buffer.alloc(pending.size);
       snapshot.set(pending.buf.subarray(0, pending.size));
@@ -468,8 +468,7 @@ export class SQLiteWorkspaceProvider {
   }
 
   chmodSync(path: string, mode: number): void {
-    const { path: canonical } = canonicalizePath(path);
-    const pending = getPendingWriteBufferByPath(this.db, canonical);
+    const pending = findPendingWriteBuffer(this.db, path);
     if (pending !== undefined) {
       // Pending-create files don't have a row yet; stash the mode on
       // the buffer so the eventual INSERT picks it up.
@@ -511,8 +510,7 @@ export class SQLiteWorkspaceProvider {
 
   existsSync(path: string): boolean {
     try {
-      const { path: canonical } = canonicalizePath(path);
-      if (getPendingWriteBufferByPath(this.db, canonical) !== undefined) return true;
+      if (findPendingWriteBuffer(this.db, path) !== undefined) return true;
       return resolveInode(this.db, path) !== null;
     } catch {
       return false;
